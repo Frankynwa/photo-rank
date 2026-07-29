@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhotoRank — 旅行照片 AI 智能筛选</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .header h1 { font-size: 28px; margin-bottom: 10px; }
+        .header p { opacity: 0.9; }
+        
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        
+        .upload-zone {
+            border: 3px dashed #667eea;
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+            background: white;
+            margin-bottom: 20px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .upload-zone:hover { background: #f0f0ff; }
+        .upload-zone.dragover { border-color: #764ba2; background: #f0f0ff; }
+        .upload-zone h3 { color: #667eea; margin-bottom: 10px; }
+        .upload-zone p { color: #666; }
+        
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-primary:hover { background: #5a6fd6; }
+        .btn-primary:disabled { background: #ccc; cursor: not-allowed; }
+        .btn-secondary { background: white; color: #667eea; border: 2px solid #667eea; }
+        .btn-secondary:hover { background: #f0f0ff; }
+        
+        .platform-selector {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .platform-btn {
+            padding: 10px 20px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .platform-btn.active { border-color: #667eea; background: #f0f0ff; }
+        .platform-btn:hover { border-color: #667eea; }
+        
+        .photo-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .photo-card {
+            background: white;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            transition: all 0.3s;
+        }
+        .photo-card:hover { transform: translateY(-4px); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
+        .photo-card img {
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
+        }
+        .photo-card .info {
+            padding: 15px;
+        }
+        .photo-card .filename {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .photo-card .score {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        .photo-card .score span {
+            font-size: 12px;
+            color: #666;
+        }
+        .photo-card .score .value {
+            font-weight: 600;
+            color: #667eea;
+        }
+        .photo-card .rank {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: #667eea;
+            color: white;
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+        }
+        .photo-card .analysis {
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #eee;
+        }
+        .photo-card .analysis .tag {
+            display: inline-block;
+            background: #f0f0ff;
+            color: #667eea;
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin-right: 4px;
+            margin-bottom: 4px;
+        }
+        
+        .status {
+            padding: 15px;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .status.show { display: block; }
+        .status.success { background: #d4edda; color: #155724; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        .status.info { background: #d1ecf1; color: #0c5460; }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-card .value {
+            font-size: 32px;
+            font-weight: 600;
+            color: #667eea;
+        }
+        .stat-card .label {
+            font-size: 14px;
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal.show { display: flex; }
+        .modal-content {
+            background: white;
+            border-radius: 12px;
+            max-width: 90vw;
+            max-height: 90vh;
+            overflow: auto;
+            padding: 20px;
+        }
+        .modal-content img {
+            max-width: 100%;
+            max-height: 60vh;
+            object-fit: contain;
+        }
+        .modal-content .analysis-detail {
+            margin-top: 20px;
+        }
+        .modal-content .analysis-detail h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+        .modal-content .analysis-detail p {
+            color: #333;
+            line-height: 1.6;
+            margin-bottom: 10px;
+        }
+        .modal-close {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: white;
+            border: none;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📸 PhotoRank</h1>
+        <p>旅行照片 AI 智能筛选 — 5 层本地模型 + Qwen-VL 深度分析</p>
+    </div>
+    
+    <div class="container">
+        <!-- 上传区域 -->
+        <div class="upload-zone" id="uploadZone">
+            <h3>📁 拖拽照片到这里</h3>
+            <p>支持 JPG、PNG、HEIC 格式</p>
+            <input type="file" id="fileInput" multiple accept="image/*" style="display: none;">
+        </div>
+        
+        <!-- 控制按钮 -->
+        <div class="controls">
+            <button class="btn btn-primary" id="analyzeBtn" disabled>🚀 开始分析</button>
+            <button class="btn btn-secondary" id="clearBtn">🗑️ 清空照片</button>
+        </div>
+        
+        <!-- 平台选择 -->
+        <div class="platform-selector">
+            <button class="platform-btn active" data-platform="xiaohongshu">📱 小红书</button>
+            <button class="platform-btn" data-platform="wechat">💬 朋友圈</button>
+            <button class="platform-btn" data-platform="douyin">🎵 抖音</button>
+        </div>
+        
+        <!-- 状态提示 -->
+        <div class="status" id="status"></div>
+        
+        <!-- 统计信息 -->
+        <div class="stats" id="stats" style="display: none;">
+            <div class="stat-card">
+                <div class="value" id="statTotal">0</div>
+                <div class="label">总照片数</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" id="statRejected">0</div>
+                <div class="label">淘汰数</div>
+            </div>
+            <div class="stat-card">
+                <div class="value" id="statOutput">0</div>
+                <div class="label">精选数</div>
+            </div>
+        </div>
+        
+        <!-- 照片网格 -->
+        <div class="photo-grid" id="photoGrid"></div>
+    </div>
+    
+    <!-- 详情弹窗 -->
+    <div class="modal" id="modal">
+        <button class="modal-close" id="modalClose">✕</button>
+        <div class="modal-content">
+            <img id="modalImage" src="" alt="">
+            <div class="analysis-detail" id="modalAnalysis"></div>
+        </div>
+    </div>
+    
+    <script>
+        // 状态
+        let currentPlatform = 'xiaohongshu';
+        let photos = [];
+        let results = [];
+        
+        // WebSocket
+        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        ws.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            handleWebSocketMessage(data);
+        };
+        
+        // 上传区域
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        
+        uploadZone.addEventListener('click', () => fileInput.click());
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+        uploadZone.addEventListener('dragleave', () => {
+            uploadZone.classList.remove('dragover');
+        });
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            uploadFiles(e.dataTransfer.files);
+        });
+        
+        fileInput.addEventListener('change', (e) => {
+            uploadFiles(e.target.files);
+        });
+        
+        // 上传文件
+        async function uploadFiles(files) {
+            const formData = new FormData();
+            for (let file of files) {
+                formData.append('files', file);
+            }
+            
+            showStatus('正在上传...', 'info');
+            
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData,
+                });
+                const data = await response.json();
+                
+                showStatus(`上传完成！共 ${data.total} 张照片`, 'success');
+                loadPhotos();
+            } catch (error) {
+                showStatus('上传失败: ' + error.message, 'error');
+            }
+        }
+        
+        // 加载照片列表
+        async function loadPhotos() {
+            try {
+                const response = await fetch('/api/photos');
+                const data = await response.json();
+                photos = data.photos;
+                
+                document.getElementById('analyzeBtn').disabled = photos.length === 0;
+                renderPhotos();
+            } catch (error) {
+                console.error('加载照片失败:', error);
+            }
+        }
+        
+        // 渲染照片网格
+        function renderPhotos() {
+            const grid = document.getElementById('photoGrid');
+            grid.innerHTML = '';
+            
+            photos.forEach((photo, index) => {
+                const card = document.createElement('div');
+                card.className = 'photo-card';
+                card.innerHTML = `
+                    <img src="/api/photos/${photo.filename}" alt="${photo.filename}">
+                    <div class="info">
+                        <div class="filename">${photo.filename}</div>
+                        <div class="score">
+                            <span>大小</span>
+                            <span class="value">${(photo.size / 1024).toFixed(1)} KB</span>
+                        </div>
+                    </div>
+                `;
+                grid.appendChild(card);
+            });
+        }
+        
+        // 开始分析
+        document.getElementById('analyzeBtn').addEventListener('click', async () => {
+            showStatus('正在分析...这可能需要几分钟', 'info');
+            document.getElementById('analyzeBtn').disabled = true;
+            
+            try {
+                const response = await fetch(`/api/analyze?platform=${currentPlatform}`, {
+                    method: 'POST',
+                });
+                const data = await response.json();
+                
+                showStatus('分析完成！', 'success');
+                loadResults();
+            } catch (error) {
+                showStatus('分析失败: ' + error.message, 'error');
+            } finally {
+                document.getElementById('analyzeBtn').disabled = false;
+            }
+        });
+        
+        // 加载结果
+        async function loadResults() {
+            try {
+                const response = await fetch(`/api/results/${currentPlatform}`);
+                const data = await response.json();
+                results = data.results;
+                
+                renderResults();
+                updateStats();
+            } catch (error) {
+                console.error('加载结果失败:', error);
+            }
+        }
+        
+        // 渲染结果
+        function renderResults() {
+            const grid = document.getElementById('photoGrid');
+            grid.innerHTML = '';
+            
+            results.forEach((result, index) => {
+                const card = document.createElement('div');
+                card.className = 'photo-card';
+                card.style.position = 'relative';
+                
+                const deep = result.deep_analysis || {};
+                const emotion = deep.emotion || {};
+                const classification = deep.classification || '';
+                const copywriting = deep.copywriting || '';
+                
+                card.innerHTML = `
+                    <div class="rank">${index + 1}</div>
+                    <img src="/api/results/${currentPlatform}/${result.filename}" alt="${result.filename}">
+                    <div class="info">
+                        <div class="filename">${result.filename}</div>
+                        <div class="score">
+                            <span>审美分</span>
+                            <span class="value">${result.aesthetic_score}</span>
+                        </div>
+                        <div class="score">
+                            <span>综合分</span>
+                            <span class="value">${result.final_score}</span>
+                        </div>
+                        ${classification ? `<div class="analysis"><span class="tag">${classification}</span></div>` : ''}
+                        ${copywriting ? `<div class="analysis">"${copywriting}"</div>` : ''}
+                    </div>
+                `;
+                
+                card.addEventListener('click', () => showDetail(result));
+                grid.appendChild(card);
+            });
+        }
+        
+        // 更新统计
+        function updateStats() {
+            document.getElementById('stats').style.display = 'grid';
+            document.getElementById('statTotal').textContent = photos.length;
+            document.getElementById('statRejected').textContent = photos.length - results.length;
+            document.getElementById('statOutput').textContent = results.length;
+        }
+        
+        // 显示详情
+        function showDetail(result) {
+            const modal = document.getElementById('modal');
+            const modalImage = document.getElementById('modalImage');
+            const modalAnalysis = document.getElementById('modalAnalysis');
+            
+            modalImage.src = `/api/results/${currentPlatform}/${result.filename}`;
+            
+            const deep = result.deep_analysis || {};
+            const emotion = deep.emotion || {};
+            
+            modalAnalysis.innerHTML = `
+                <h3>📊 评分</h3>
+                <p>审美分: ${result.aesthetic_score} | 综合分: ${result.final_score}</p>
+                
+                <h3>🏷️ 分类</h3>
+                <p>${deep.classification || '未分析'}</p>
+                
+                <h3>🎨 构图分析</h3>
+                <p>${deep.composition || '未分析'}</p>
+                
+                <h3>💡 改进建议</h3>
+                <p>${deep.improvement || '未分析'}</p>
+                
+                <h3>😊 情绪分析</h3>
+                <p>主要情绪: ${emotion.primary_emotion || '未知'} (${emotion.emotion_intensity || 5}/10)</p>
+                <p>关键词: ${(emotion.mood_keywords || []).join(', ')}</p>
+                
+                <h3>✍️ 文案</h3>
+                <p>"${deep.copywriting || '未生成'}"</p>
+            `;
+            
+            modal.classList.add('show');
+        }
+        
+        // 关闭弹窗
+        document.getElementById('modalClose').addEventListener('click', () => {
+            document.getElementById('modal').classList.remove('show');
+        });
+        document.getElementById('modal').addEventListener('click', (e) => {
+            if (e.target === document.getElementById('modal')) {
+                document.getElementById('modal').classList.remove('show');
+            }
+        });
+        
+        // 平台切换
+        document.querySelectorAll('.platform-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.platform-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                currentPlatform = btn.dataset.platform;
+                if (results.length > 0) {
+                    loadResults();
+                }
+            });
+        });
+        
+        // 清空照片
+        document.getElementById('clearBtn').addEventListener('click', async () => {
+            if (!confirm('确定要清空所有照片吗？')) return;
+            
+            for (let photo of photos) {
+                await fetch(`/api/photos/${photo.filename}`, { method: 'DELETE' });
+            }
+            
+            photos = [];
+            results = [];
+            renderPhotos();
+            document.getElementById('stats').style.display = 'none';
+            showStatus('已清空所有照片', 'info');
+        });
+        
+        // 显示状态
+        function showStatus(message, type) {
+            const status = document.getElementById('status');
+            status.textContent = message;
+            status.className = `status show ${type}`;
+        }
+        
+        // WebSocket 消息处理
+        function handleWebSocketMessage(data) {
+            switch (data.type) {
+                case 'upload_complete':
+                    showStatus(`上传完成！共 ${data.count} 张照片`, 'success');
+                    loadPhotos();
+                    break;
+                case 'analysis_start':
+                    showStatus('开始分析...', 'info');
+                    break;
+                case 'analysis_complete':
+                    showStatus('分析完成！', 'success');
+                    loadResults();
+                    break;
+                case 'analysis_error':
+                    showStatus('分析失败: ' + data.error, 'error');
+                    break;
+            }
+        }
+        
+        // 初始化
+        loadPhotos();
+    </script>
+</body>
+</html>

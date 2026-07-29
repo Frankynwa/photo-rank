@@ -1,4 +1,5 @@
 """PhotoRank 配置"""
+import os
 from pathlib import Path
 
 # 项目路径
@@ -51,11 +52,19 @@ TOP_K_PER_CATEGORY = 5       # 每类选 Top 5
 FINAL_OUTPUT_COUNT = 12      # 最终每平台输出
 
 # Layer 5: Qwen-VL API
-QWEN_BASE_URL = "https://llm-1r8e612iutxlixav.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
-QWEN_MODEL = "qwen-vl-max"
+# 新的 Qwen API 地址（2026年7月后启用）
+# 优先从环境变量 QWEN_BASE_URL 读取，方便不同环境使用不同的 API 端点
+QWEN_BASE_URL = os.environ.get(
+    "QWEN_BASE_URL",
+    "https://coding.dashscope.aliyuncs.com/v1",
+)
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-vl-max")
 
-# 代理
-PROXY = "http://127.0.0.1:7890"
+# 代理配置
+# 不要硬编码代理地址！从系统环境变量 HTTPS_PROXY 自动获取。
+# 如果需要代理，启动前设置: export HTTPS_PROXY=http://127.0.0.1:7890
+# 不需要代理时留空即可。
+PROXY = os.environ.get("HTTPS_PROXY", "")
 
 # Web UI
 HOST = "127.0.0.1"

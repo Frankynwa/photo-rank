@@ -4,17 +4,39 @@ import base64
 import json
 import httpx
 from pathlib import Path
+from dotenv import load_dotenv
 from config import QWEN_BASE_URL, QWEN_MODEL, PROXY
 
 
 def get_api_key() -> str:
-    """从 .env 文件读取 API Key"""
-    env_path = Path(r"C:\Users\Administrator\AppData\Local\hermes\.env")
-    with open(env_path, "r") as f:
-        for line in f:
-            if line.startswith("QWEN_API_KEY"):
-                return line.strip().split("=", 1)[1]
-    raise ValueError("QWEN_API_KEY not found in .env")
+    """获取 Qwen API Key
+
+    读取优先级：
+    1. 系统环境变量 QWEN_API_KEY（适合生产部署，如 export / .env / Docker -e）
+    2. 项目根目录 .env 文件（适合本地开发，通过 python-dotenv 自动加载）
+
+    为什么不再硬编码路径？
+    - 硬编码路径（如 C:\\Users\\...）只能在特定机器上运行，换个系统就会崩溃。
+    - 使用环境变量 + .env 是业界标准做法，既安全又灵活。
+    """
+    # 先尝试从系统环境变量中读取（最高优先级）
+    api_key = os.environ.get("QWEN_API_KEY")
+    if api_key:
+        return api_key
+
+    # 环境变量没有，尝试从项目根目录的 .env 文件加载
+    # load_dotenv() 会自动查找当前工作目录及其父目录中的 .env 文件
+    load_dotenv()
+    api_key = os.environ.get("QWEN_API_KEY")
+    if api_key:
+        return api_key
+
+    # 都找不到，给出明确的错误提示
+    raise ValueError(
+        "找不到 QWEN_API_KEY！请通过以下任一方式配置：\n"
+        "  1. 设置环境变量: export QWEN_API_KEY=your_key\n"
+        "  2. 在项目根目录创建 .env 文件，写入: QWEN_API_KEY=your_key"
+    )
 
 
 def encode_image(image_path: str | Path, max_size: int = 1024) -> str:
@@ -136,7 +158,8 @@ async def analyze_emotion(image_path: str | Path) -> dict:
         elif "```" in result:
             result = result.split("```")[1].split("```")[0]
         return json.loads(result.strip())
-    except:
+    except Exception as e:
+        print(f"[Layer5] Error: {e}")
         return {
             "primary_emotion": "未知",
             "emotion_intensity": 5,

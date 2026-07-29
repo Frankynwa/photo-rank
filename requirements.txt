@@ -1,7 +1,22 @@
+# === 核心依赖（Web 服务） ===
 fastapi>=0.100.0
 uvicorn[standard]>=0.30.0
 httpx>=0.27.0
-Pillow>=10.0.0
-pillow-heif>=0.15.0
 python-multipart>=0.0.9
 PyYAML>=6.0
+python-dotenv>=1.0.0
+
+# === 图像处理依赖 ===
+Pillow>=10.0.0
+pillow-heif>=0.15.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+imagehash>=4.3.0
+
+# === AI 模型依赖 ===
+# torch 需要匹配 CUDA 版本，建议从 https://pytorch.org 获取安装命令，例如：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
+# 因此不在此处直接声明，需手动安装。
+# torch>=2.0.0
+pyiqa>=0.9.0
+mediapipe>=0.10.0

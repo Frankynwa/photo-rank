@@ -1,23 +1,21 @@
-"""Layer 5 深度分析单元测试 — 纯逻辑测试 + 条件性 API 集成测试"""
+"""Layer 5 深度分析单元测试 — mock httpx，不依赖网络"""
 import json
-import os
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
 from PIL import Image
 
-from core.models import EmotionAnalysis, Layer5Result
-
 # ---------------------------------------------------------------------------
-# 始终可测的纯函数 / 轻量函数
+# 始终可测的纯函数 / 轻量函数（无需 mock）
 # ---------------------------------------------------------------------------
-from core.layer5_analysis import (  # noqa: E402
+from core.layer5_analysis import (
     _extract_json,
     encode_image,
     get_api_key,
 )
-
+from core.models import EmotionAnalysis, Layer5Result
 
 # ---------------------------------------------------------------------------
 # 辅助工具
@@ -35,6 +33,27 @@ def _make_random_image(path: Path, size=(128, 128)):
     img = Image.fromarray(arr)
     img.save(str(path))
     return path
+
+
+def _mock_api_response(content: str):
+    """构建模拟的 httpx 响应"""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "choices": [{"message": {"content": content}}]
+    }
+    mock_response.raise_for_status = MagicMock()
+    return mock_response
+
+
+def _make_async_client_mock(response_content: str):
+    """创建返回指定内容的 AsyncClient mock"""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(
+        return_value=_mock_api_response(response_content)
+    )
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    return mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -92,19 +111,18 @@ class TestExtractJson:
         assert result["emotion"]["type"] == "快乐"
         assert len(result["keywords"]) == 2
 
-    def test_malformed_json_fallback(self):
-        """第一个 { 到最后一个 } 的 fallback 应处理尾部多余文本"""
-        text = '{"key": "value"} 一些额外文字 }'
-        result = _extract_json(text)
-        # fallback 从第一个 { 到最后一个 }，可能解析失败 → 返回 {}
-        # 也可能恰好解析成功 → 取决于 json.loads 行为
-        assert isinstance(result, dict)
-
     def test_json_with_special_characters(self):
         """含中文和特殊字符的 JSON 应正确解析"""
         text = '{"style": "文艺/哲思", "text": "你好，世界！"}'
         result = _extract_json(text)
         assert result["style"] == "文艺/哲思"
+
+    def test_json_array_not_extracted(self):
+        """JSON 数组（不以 { 开头）应走 fallback 路径"""
+        text = '[1, 2, 3]'
+        result = _extract_json(text)
+        # 不以 { 开头，没有 ``` 包裹，没有 { → 返回 {}
+        assert result == {}
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +154,6 @@ class TestEncodeImage:
         p = _make_random_image(tmp_path / "sizes.png", size=(512, 512))
         b64_small = encode_image(p, max_size=128)
         b64_large = encode_image(p, max_size=512)
-        # 压缩后大图编码应更长
         assert len(b64_large) > len(b64_small)
 
     def test_rgb_conversion(self, tmp_path: Path):
@@ -156,7 +173,6 @@ class TestGetApiKey:
     def test_api_key_from_env(self, monkeypatch):
         """环境变量中有 QWEN_API_KEY 时应返回"""
         import core.layer5_analysis as l5
-        # 清除缓存
         old_cache = l5._api_key_cache
         l5._api_key_cache = None
         try:
@@ -173,7 +189,6 @@ class TestGetApiKey:
         l5._api_key_cache = None
         try:
             monkeypatch.delenv("QWEN_API_KEY", raising=False)
-            # 确保 .env 中也没有
             monkeypatch.setattr("core.layer5_analysis.load_dotenv", lambda: None)
             with pytest.raises(ValueError, match="QWEN_API_KEY"):
                 get_api_key()
@@ -193,43 +208,260 @@ class TestGetApiKey:
 
 
 # ---------------------------------------------------------------------------
-# 条件性 API 集成测试（需要 QWEN_API_KEY）
+# 异步 API 调用测试（mock httpx）
 # ---------------------------------------------------------------------------
 
-_has_api_key = bool(os.environ.get("QWEN_API_KEY"))
+class TestCallApi:
+    @pytest.mark.asyncio
+    async def test_successful_api_call(self, tmp_path):
+        """成功的 API 调用应返回响应内容"""
+        from core.layer5_analysis import _call_api
+        p = _make_random_image(tmp_path / "api.png")
 
-@pytest.mark.skipif(not _has_api_key, reason="需要设置 QWEN_API_KEY 环境变量")
-class TestAPIIntegration:
-    """需要真实 API Key 的集成测试"""
+        mock_client = _make_async_client_mock("分类结果：1. 风景")
+        with patch("core.layer5_analysis.httpx.AsyncClient", return_value=mock_client), \
+             patch("core.layer5_analysis.get_api_key", return_value="fake-key"):
+            result = await _call_api("test prompt", p)
 
-    @pytest.fixture
-    def test_image(self, tmp_path: Path):
-        p = _make_random_image(tmp_path / "api_test.png", size=(256, 256))
-        return p
+        assert result == "分类结果：1. 风景"
 
     @pytest.mark.asyncio
-    async def test_classify_photo(self, test_image):
-        """classify_photo 应返回非空字符串"""
-        from core.layer5_analysis import classify_photo
-        result = await classify_photo(test_image)
-        assert isinstance(result, str)
-        assert len(result) > 0
+    async def test_api_call_retries_on_failure(self, tmp_path):
+        """API 调用失败应按指数退避重试"""
+        from core.layer5_analysis import _call_api
+        p = _make_random_image(tmp_path / "retry.png")
+
+        mock_client = AsyncMock()
+        # 前两次失败，第三次成功
+        mock_client.post = AsyncMock(
+            side_effect=[
+                Exception("timeout"),
+                Exception("timeout"),
+                _mock_api_response("成功"),
+            ]
+        )
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("core.layer5_analysis.httpx.AsyncClient", return_value=mock_client), \
+             patch("core.layer5_analysis.get_api_key", return_value="fake-key"), \
+             patch("core.layer5_analysis.asyncio.sleep", new_callable=AsyncMock):
+            result = await _call_api("test", p, max_retries=3)
+
+        assert result == "成功"
+        assert mock_client.post.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_analyze_emotion(self, test_image):
-        """analyze_emotion 应返回 EmotionAnalysis"""
+    async def test_api_call_exhausts_retries(self, tmp_path):
+        """所有重试都失败应抛出异常"""
+        from core.layer5_analysis import _call_api
+        p = _make_random_image(tmp_path / "fail.png")
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=Exception("always fails"))
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("core.layer5_analysis.httpx.AsyncClient", return_value=mock_client), \
+             patch("core.layer5_analysis.get_api_key", return_value="fake-key"), \
+             patch("core.layer5_analysis.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(Exception, match="always fails"):
+                await _call_api("test", p, max_retries=2)
+
+
+# ---------------------------------------------------------------------------
+# 情绪分析结果解析测试
+# ---------------------------------------------------------------------------
+
+class TestAnalyzeEmotion:
+    @pytest.mark.asyncio
+    async def test_valid_emotion_json(self, tmp_path):
+        """有效的情绪分析 JSON 应被正确解析为 EmotionAnalysis"""
         from core.layer5_analysis import analyze_emotion
-        result = await analyze_emotion(test_image)
+        p = _make_random_image(tmp_path / "emotion.png")
+
+        emotion_json = json.dumps({
+            "primary_emotion": "快乐",
+            "emotion_intensity": 8,
+            "mood_keywords": ["阳光", "微笑"],
+            "suitable_copywriting_style": "温暖",
+        })
+        mock_client = _make_async_client_mock(emotion_json)
+
+        with patch("core.layer5_analysis.httpx.AsyncClient", return_value=mock_client), \
+             patch("core.layer5_analysis.get_api_key", return_value="fake-key"):
+            result = await analyze_emotion(p)
+
         assert isinstance(result, EmotionAnalysis)
-        assert result.primary_emotion
-        assert 0 <= result.emotion_intensity <= 10
+        assert result.primary_emotion == "快乐"
+        assert result.emotion_intensity == 8.0
+        assert "阳光" in result.mood_keywords
+        assert result.suitable_copywriting_style == "温暖"
 
     @pytest.mark.asyncio
-    async def test_batch_deep_analyze(self, test_image):
-        """batch_deep_analyze 应返回 Layer5Result 列表"""
+    async def test_invalid_json_returns_defaults(self, tmp_path):
+        """无法解析的 JSON 应返回默认 EmotionAnalysis"""
+        from core.layer5_analysis import analyze_emotion
+        p = _make_random_image(tmp_path / "bad_json.png")
+
+        mock_client = _make_async_client_mock("这不是 JSON")
+
+        with patch("core.layer5_analysis.httpx.AsyncClient", return_value=mock_client), \
+             patch("core.layer5_analysis.get_api_key", return_value="fake-key"):
+            result = await analyze_emotion(p)
+
+        default = EmotionAnalysis()
+        assert result.primary_emotion == default.primary_emotion
+        assert result.emotion_intensity == default.emotion_intensity
+
+    @pytest.mark.asyncio
+    async def test_partial_json_fills_defaults(self, tmp_path):
+        """部分字段的 JSON 应填充默认值"""
+        from core.layer5_analysis import analyze_emotion
+        p = _make_random_image(tmp_path / "partial.png")
+
+        emotion_json = json.dumps({"primary_emotion": "宁静"})
+        mock_client = _make_async_client_mock(emotion_json)
+
+        with patch("core.layer5_analysis.httpx.AsyncClient", return_value=mock_client), \
+             patch("core.layer5_analysis.get_api_key", return_value="fake-key"):
+            result = await analyze_emotion(p)
+
+        assert result.primary_emotion == "宁静"
+        # 缺失字段使用默认值
+        default = EmotionAnalysis()
+        assert result.emotion_intensity == default.emotion_intensity
+        assert result.mood_keywords == default.mood_keywords
+
+
+# ---------------------------------------------------------------------------
+# 深度分析集成测试（mock API）
+# ---------------------------------------------------------------------------
+
+class TestDeepAnalyze:
+    @pytest.mark.asyncio
+    async def test_deep_analyze_all_success(self, tmp_path):
+        """所有 API 调用成功时应返回完整 Layer5Result"""
+        from core.layer5_analysis import deep_analyze
+        p = _make_random_image(tmp_path / "deep.png")
+
+        with patch("core.layer5_analysis._call_api", new_callable=AsyncMock) as mock_api:
+            mock_api.side_effect = [
+                "1. 风景",                    # classify_photo
+                "三分法构图",                  # analyze_composition
+                "提高亮度",                    # suggest_improvement
+                '{"primary_emotion": "宁静"}', # analyze_emotion
+                "光影之间，是时间的低语",       # generate_copywriting
+            ]
+            result = await deep_analyze(p)
+
+        assert isinstance(result, Layer5Result)
+        assert result.classification == "1. 风景"
+        assert result.composition == "三分法构图"
+        assert result.improvement == "提高亮度"
+        assert result.emotion.primary_emotion == "宁静"
+        assert result.copywriting == "光影之间，是时间的低语"
+
+    @pytest.mark.asyncio
+    async def test_deep_analyze_partial_failure(self, tmp_path):
+        """部分 API 调用失败时应使用默认值"""
+        from core.layer5_analysis import deep_analyze
+        p = _make_random_image(tmp_path / "partial_fail.png")
+
+        with patch("core.layer5_analysis._call_api", new_callable=AsyncMock) as mock_api:
+            mock_api.side_effect = [
+                "1. 风景",
+                Exception("API error"),       # 构图失败
+                "提高亮度",
+                '{"primary_emotion": "温暖"}',
+                "好文案",
+            ]
+            result = await deep_analyze(p)
+
+        assert result.classification == "1. 风景"
+        assert result.composition == "API 调用失败"
+        assert result.improvement == "提高亮度"
+
+
+# ---------------------------------------------------------------------------
+# 并发控制测试
+# ---------------------------------------------------------------------------
+
+class TestBatchDeepAnalyze:
+    @pytest.mark.asyncio
+    async def test_batch_processes_all_images(self, tmp_path):
+        """batch_deep_analyze 应处理所有图片"""
         from core.layer5_analysis import batch_deep_analyze
-        results = await batch_deep_analyze([test_image])
-        assert len(results) == 1
-        r = results[0]
-        assert isinstance(r, Layer5Result)
-        assert r.filename == test_image.name
+        paths = [_make_random_image(tmp_path / f"batch{i}.png") for i in range(3)]
+
+        async def fake_deep_analyze(path, platform="xiaohongshu"):
+            return Layer5Result(
+                path=str(path), filename=Path(path).name,
+                classification="风景", composition="构图好",
+                improvement="调亮", copywriting="文案",
+                platform=platform,
+            )
+
+        with patch("core.layer5_analysis.deep_analyze", side_effect=fake_deep_analyze):
+            results = await batch_deep_analyze(paths)
+
+        assert len(results) == 3
+        for r in results:
+            assert isinstance(r, Layer5Result)
+            assert r.classification == "风景"
+
+    @pytest.mark.asyncio
+    async def test_batch_handles_exception(self, tmp_path):
+        """batch 中单个任务异常不应影响其他结果"""
+        from core.layer5_analysis import batch_deep_analyze
+        paths = [_make_random_image(tmp_path / f"exc{i}.png") for i in range(3)]
+
+        call_count = 0
+
+        async def flaky_deep_analyze(path, platform="xiaohongshu"):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("boom")
+            return Layer5Result(
+                path=str(path), filename=Path(path).name,
+                classification="成功", platform=platform,
+            )
+
+        with patch("core.layer5_analysis.deep_analyze", side_effect=flaky_deep_analyze):
+            results = await batch_deep_analyze(paths)
+
+        assert len(results) == 3
+        # 第一个和第三个成功
+        assert results[0].classification == "成功"
+        assert results[2].classification == "成功"
+        # 第二个失败 → 填充错误信息
+        assert results[1].classification == "分析失败"
+        assert "boom" in results[1].composition
+
+    @pytest.mark.asyncio
+    async def test_batch_empty_list(self):
+        """空列表应返回空结果"""
+        from core.layer5_analysis import batch_deep_analyze
+        results = await batch_deep_analyze([])
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_batch_platform_propagated(self, tmp_path):
+        """platform 参数应传递到每个 deep_analyze 调用"""
+        from core.layer5_analysis import batch_deep_analyze
+        paths = [_make_random_image(tmp_path / "plat.png")]
+
+        received_platforms = []
+
+        async def capture_platform(path, platform="xiaohongshu"):
+            received_platforms.append(platform)
+            return Layer5Result(
+                path=str(path), filename=Path(path).name,
+                platform=platform,
+            )
+
+        with patch("core.layer5_analysis.deep_analyze", side_effect=capture_platform):
+            await batch_deep_analyze(paths, platform="wechat")
+
+        assert received_platforms == ["wechat"]

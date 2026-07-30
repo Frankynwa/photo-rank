@@ -13,3 +13,4 @@ ignore = ["E501"]  # 允许超长行（已有代码风格）
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

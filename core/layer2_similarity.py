@@ -14,7 +14,8 @@ from core.models import SimilarityCluster as SimilarityClusterModel
 logger = logging.getLogger(__name__)
 
 # BK-Tree 小数据集 fallback 阈值
-_BK_TREE_FALLBACK_SIZE = 50
+# 当照片数 < 此值时，Python 级别的暴力搜索因更低的常数开销反而更快
+_BK_TREE_FALLBACK_SIZE = 500
 
 
 @dataclass
@@ -79,16 +80,6 @@ class _BKTree:
                 child._query_recursive(target, threshold, results)
 
 
-def _build_bktree(hashes: list[imagehash.ImageHash]) -> _BKTree | None:
-    """从哈希列表构建 BK-Tree，返回根节点"""
-    if not hashes:
-        return None
-    root = _BKTree(hashes[0])
-    for h in hashes[1:]:
-        root.insert(h)
-    return root
-
-
 def _brute_force_pairs(
     valid: list[str],
     hashes: dict[str, imagehash.ImageHash],
@@ -109,33 +100,29 @@ def _bktree_pairs(
     threshold: int,
     uf: _UnionFind,
 ) -> None:
-    """使用 BK-Tree 进行范围查询，避免 O(n²) 全量比较"""
-    hash_list = [hashes[p] for p in valid]
-    tree = _build_bktree(hash_list)
-    if tree is None:
-        return
+    """使用增量 BK-Tree 进行范围查询，避免 O(n²) 全量比较
 
-    # 预建哈希值 -> 索引列表 的映射，加速重复哈希查找
-    hash_to_indices: dict[str, list[int]] = {}
-    for i, h in enumerate(hash_list):
-        key = str(h)
-        if key not in hash_to_indices:
-            hash_to_indices[key] = []
-        hash_to_indices[key].append(i)
+    核心思路：逐张插入，每张照片插入前先在已有树中查询邻居，
+    天然避免重复配对，无需 seen_pairs 集合。
+    """
+    tree = _BKTree(hashes[valid[0]])
+    # 增量维护：哈希值 -> 已插入索引列表（直接用 ImageHash 对象作键）
+    hash_to_indices: dict[imagehash.ImageHash, list[int]] = {}
+    h0 = hashes[valid[0]]
+    hash_to_indices[h0] = [0]
 
-    # 对每张照片，用 BK-Tree 查找距离 ≤ threshold 的邻居
-    seen_pairs: set[tuple[int, int]] = set()
-    for i, p in enumerate(valid):
-        neighbors = tree.query(hashes[p], threshold)
-        for nh in neighbors:
-            nh_key = str(nh)
-            for j in hash_to_indices.get(nh_key, []):
-                if j == i:
-                    continue
-                pair = (min(i, j), max(i, j))
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    uf.union(i, j)
+    for i in range(1, len(valid)):
+        h = hashes[valid[i]]
+        # 在已插入的 i 张照片中查找距离 ≤ threshold 的邻居
+        for nh in tree.query(h, threshold):
+            for j in hash_to_indices.get(nh, []):
+                uf.union(j, i)
+        # 查询完毕后再插入，避免自匹配
+        tree.insert(h)
+        if h in hash_to_indices:
+            hash_to_indices[h].append(i)
+        else:
+            hash_to_indices[h] = [i]
 
 
 class _UnionFind:

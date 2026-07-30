@@ -24,8 +24,10 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest ruff
+        pip install pytest pytest-asyncio ruff
+        # 跳过重量级依赖（pyiqa/mediapipe），测试已 mock
+        pip install fastapi uvicorn httpx python-multipart PyYAML python-dotenv
+        pip install Pillow pillow-heif opencv-python numpy imagehash
 
     - name: Run ruff
       run: ruff check .

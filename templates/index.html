@@ -154,6 +154,75 @@
         .status.error { background: #f8d7da; color: #721c24; }
         .status.info { background: #d1ecf1; color: #0c5460; }
         
+        .progress-container {
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .progress-container.show { display: block; }
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .progress-header .layer-text {
+            font-weight: 600;
+            color: #333;
+            font-size: 15px;
+        }
+        .progress-header .layer-detail {
+            font-size: 13px;
+            color: #666;
+        }
+        .progress-bar-track {
+            width: 100%;
+            height: 10px;
+            background: #e9ecef;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            border-radius: 5px;
+            transition: width 0.4s ease;
+            width: 0%;
+        }
+        .progress-steps {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 10px;
+            font-size: 12px;
+            color: #999;
+        }
+        .progress-steps .step {
+            transition: color 0.3s;
+        }
+        .progress-steps .step.active {
+            color: #667eea;
+            font-weight: 600;
+        }
+        .progress-steps .step.done {
+            color: #28a745;
+        }
+        .ws-status {
+            position: fixed;
+            bottom: 12px;
+            right: 12px;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 12px;
+            color: white;
+            z-index: 999;
+            transition: all 0.3s;
+        }
+        .ws-status.connected { background: #28a745; }
+        .ws-status.disconnected { background: #dc3545; }
+        .ws-status.reconnecting { background: #ffc107; color: #333; }
+        
         .stats {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -256,6 +325,24 @@
             <button class="platform-btn" data-platform="douyin">🎵 抖音</button>
         </div>
         
+        <!-- 进度条 -->
+        <div class="progress-container" id="progressContainer">
+            <div class="progress-header">
+                <span class="layer-text" id="layerText">准备中...</span>
+                <span class="layer-detail" id="layerDetail"></span>
+            </div>
+            <div class="progress-bar-track">
+                <div class="progress-bar-fill" id="progressBar"></div>
+            </div>
+            <div class="progress-steps" id="progressSteps">
+                <span class="step" data-layer="1">L1 客观</span>
+                <span class="step" data-layer="2">L2 相似</span>
+                <span class="step" data-layer="3">L3 审美</span>
+                <span class="step" data-layer="4">L4 人脸</span>
+                <span class="step" data-layer="5">L5 深度</span>
+            </div>
+        </div>
+        
         <!-- 状态提示 -->
         <div class="status" id="status"></div>
         
@@ -288,18 +375,67 @@
         </div>
     </div>
     
+    <!-- WebSocket 连接状态 -->
+    <div class="ws-status disconnected" id="wsStatus">未连接</div>
+    
     <script>
         // 状态
         let currentPlatform = 'xiaohongshu';
         let photos = [];
         let results = [];
         
-        // WebSocket
-        const ws = new WebSocket(`ws://${window.location.host}/ws`);
-        ws.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            handleWebSocketMessage(data);
-        };
+        // ── WebSocket（含自动重连） ──
+        let ws = null;
+        let wsReconnectTimer = null;
+        
+        function wsConnect() {
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+            
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            
+            ws.onopen = function() {
+                updateWsStatus('connected');
+                if (wsReconnectTimer) {
+                    clearTimeout(wsReconnectTimer);
+                    wsReconnectTimer = null;
+                }
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                handleWebSocketMessage(data);
+            };
+            
+            ws.onclose = function() {
+                updateWsStatus('disconnected');
+                scheduleReconnect();
+            };
+            
+            ws.onerror = function() {
+                updateWsStatus('disconnected');
+                ws.close();
+            };
+        }
+        
+        function scheduleReconnect() {
+            if (wsReconnectTimer) return;
+            updateWsStatus('reconnecting');
+            wsReconnectTimer = setTimeout(function() {
+                wsReconnectTimer = null;
+                wsConnect();
+            }, 3000);
+        }
+        
+        function updateWsStatus(state) {
+            const el = document.getElementById('wsStatus');
+            el.className = 'ws-status ' + state;
+            const labels = { connected: '已连接', disconnected: '已断开', reconnecting: '重连中...' };
+            el.textContent = labels[state] || state;
+        }
+        
+        // 初始连接
+        wsConnect();
         
         // 上传区域
         const uploadZone = document.getElementById('uploadZone');
@@ -549,16 +685,93 @@
                     loadPhotos();
                     break;
                 case 'analysis_start':
-                    showStatus('开始分析...', 'info');
+                    showProgress(true);
+                    updateProgress(0, '准备分析...', '');
+                    break;
+                case 'layer_start':
+                    handleLayerStart(data);
+                    break;
+                case 'layer_end':
+                case 'layer_complete':
+                    handleLayerEnd(data);
+                    break;
+                case 'layer_progress':
+                    handleLayerProgress(data);
                     break;
                 case 'analysis_complete':
+                    showProgress(false);
                     showStatus('分析完成！', 'success');
                     loadResults();
                     break;
                 case 'analysis_error':
+                    showProgress(false);
                     showStatus('分析失败: ' + data.error, 'error');
                     break;
             }
+        }
+        
+        // ── 进度条逻辑 ──
+        const LAYER_NAMES = { 0: '准备', 1: '客观指标', 2: '相似聚类', 3: '审美评分', 4: '人脸质量', 5: '深度分析' };
+        
+        function showProgress(visible) {
+            document.getElementById('progressContainer').classList.toggle('show', visible);
+            if (visible) {
+                // 重置所有步骤状态
+                document.querySelectorAll('#progressSteps .step').forEach(s => {
+                    s.className = 'step';
+                });
+            }
+        }
+        
+        function updateProgress(layer, text, detail) {
+            document.getElementById('layerText').textContent = text;
+            document.getElementById('layerDetail').textContent = detail || '';
+            // 进度百分比：layer 0~5 映射到 0%~100%
+            const pct = Math.min(100, Math.round((layer / 5) * 100));
+            document.getElementById('progressBar').style.width = pct + '%';
+            
+            // 更新步骤指示器
+            document.querySelectorAll('#progressSteps .step').forEach(s => {
+                const sl = parseInt(s.dataset.layer);
+                if (sl < layer) s.className = 'step done';
+                else if (sl === layer) s.className = 'step active';
+                else s.className = 'step';
+            });
+        }
+        
+        function handleLayerStart(data) {
+            const layer = data.layer || 0;
+            const name = data.layer_name || LAYER_NAMES[layer] || '';
+            const total = data.total ? ` (${data.total} 张照片)` : '';
+            if (layer === 0) {
+                updateProgress(0, '开始分析...', `共 ${data.total || '?'} 张照片`);
+            } else {
+                updateProgress(layer, `Layer ${layer}/5: ${name}中...`, total);
+            }
+        }
+        
+        function handleLayerEnd(data) {
+            const layer = data.layer || 0;
+            const name = data.layer_name || LAYER_NAMES[layer] || '';
+            let detail = '';
+            if (data.kept !== undefined) detail = `保留 ${data.kept} 张`;
+            else if (data.groups !== undefined) detail = `${data.groups} 组代表`;
+            else if (data.scored !== undefined) detail = `已评分 ${data.scored} 张`;
+            else if (data.faces !== undefined) detail = `检测到 ${data.faces} 张人脸`;
+            else if (data.done !== undefined) detail = `完成 ${data.done} 张分析`;
+            
+            updateProgress(layer, `Layer ${layer}/5: ${name} 完成`, detail);
+        }
+        
+        function handleLayerProgress(data) {
+            const layer = data.layer || 5;
+            const current = data.current || 0;
+            const total = data.total || 1;
+            const name = data.layer_name || '深度分析';
+            const pct = Math.round(((layer - 1 + current / total) / 5) * 100);
+            document.getElementById('progressBar').style.width = pct + '%';
+            document.getElementById('layerText').textContent = `Layer ${layer}/5: ${name} (${current}/${total})`;
+            document.getElementById('layerDetail').textContent = data.message || '';
         }
         
         // 初始化

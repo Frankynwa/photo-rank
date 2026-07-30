@@ -1,21 +1,25 @@
 """PhotoRank Web UI — FastAPI + 原生 HTML/JS"""
-import json
 import asyncio
+import json
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse
+
 import uvicorn
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse
+
 # ─────────────────────────────────────────────────────────
 # 统一从 config.py 导入配置，消除重复定义
 # ─────────────────────────────────────────────────────────
 from config import (
-    PROJECT_ROOT,
-    PHOTOS_DIR as UPLOADS_DIR,   # config.py 中命名为 PHOTOS_DIR
-    OUTPUT_DIR,
     HOST,
+    OUTPUT_DIR,
     PORT,
+    PROJECT_ROOT,
 )
-from core.logger import setup_logging, get_logger
+from config import (
+    PHOTOS_DIR as UPLOADS_DIR,  # config.py 中命名为 PHOTOS_DIR
+)
+from core.logger import get_logger, setup_logging
 
 setup_logging()
 logger = get_logger(__name__)
@@ -55,14 +59,14 @@ TEMPLATES_DIR.mkdir(exist_ok=True)
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
-    
+
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-    
+
     def disconnect(self, websocket: WebSocket):
         self.active_connections.remove(websocket)
-    
+
     async def broadcast(self, message: dict):
         for connection in self.active_connections:
             try:
@@ -245,7 +249,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            data = await websocket.receive_text()
+            _ = await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 

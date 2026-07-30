@@ -1,13 +1,16 @@
 """Layer 4: 人脸质量 — MediaPipe Face Landmarker"""
-import os
-import time
-import threading
 import logging
+import os
+import threading
+import time
 import urllib.request
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
+
 import numpy as np
 from PIL import Image
+
+from core.models import Layer4Result
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +92,6 @@ class FaceAnalyzer:
             if not model_path:
                 raise RuntimeError("模型下载失败")
 
-            import mediapipe as mp
             from mediapipe.tasks import python
             from mediapipe.tasks.python import vision
 
@@ -165,22 +167,22 @@ class FaceAnalyzer:
             logger.debug(f"人脸分析失败 {Path(image_path).name}: {e}")
             return FaceQuality()
 
-    def batch_analyze(self, image_paths: list[str | Path]) -> list[dict]:
+    def batch_analyze(self, image_paths: list[str | Path]) -> list[Layer4Result]:
         results = []
         for path in image_paths:
             quality = self.analyze_face(path)
-            results.append({
-                "path": str(path), "filename": Path(path).name,
-                "face_count": quality.face_count, "has_face": quality.has_face,
-                "blink_detected": quality.blink_detected,
-                "expression_score": quality.expression_score,
-                "face_clarity": quality.face_clarity,
-                "overall_face_score": quality.overall_face_score,
-            })
+            results.append(Layer4Result(
+                path=str(path), filename=Path(path).name,
+                face_count=quality.face_count, has_face=quality.has_face,
+                blink_detected=quality.blink_detected,
+                expression_score=quality.expression_score,
+                face_clarity=quality.face_clarity,
+                overall_face_score=quality.overall_face_score,
+            ))
         return results
 
 
-def analyze_faces(image_paths: list[str | Path]) -> list[dict]:
+def analyze_faces(image_paths: list[str | Path]) -> list[Layer4Result]:
     """批量人脸分析（复用全局实例）"""
     global _global_analyzer
     with _global_analyzer_lock:

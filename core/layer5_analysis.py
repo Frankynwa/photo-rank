@@ -2,18 +2,21 @@
 
 支持并行 API 调用，指数退避重试，JSON 提取增强。
 """
-import os
-import base64
-import json
 import asyncio
-import threading
-import logging
-from pathlib import Path
-from PIL import Image
+import base64
 import io
+import json
+import logging
+import os
+import threading
+from pathlib import Path
+
 import httpx
 from dotenv import load_dotenv
-from config import QWEN_BASE_URL, QWEN_MODEL, PROXY
+from PIL import Image
+
+from config import PROXY, QWEN_BASE_URL, QWEN_MODEL
+from core.models import EmotionAnalysis, Layer5Result
 
 logger = logging.getLogger(__name__)
 
@@ -146,16 +149,19 @@ async def suggest_improvement(image_path: str | Path) -> str:
     return (await _call_api(prompt, image_path)).strip()
 
 
-async def analyze_emotion(image_path: str | Path) -> dict:
+async def analyze_emotion(image_path: str | Path) -> EmotionAnalysis:
     prompt = """分析照片情绪（JSON）：{"primary_emotion":"快乐/宁静/震撼/孤独/温暖/自由/期待/感动","emotion_intensity":8,"mood_keywords":["k1","k2","k3"],"suitable_copywriting_style":"文艺/哲思/温暖/幽默/简洁"}"""
     result = await _call_api(prompt, image_path)
     parsed = _extract_json(result)
     if not parsed:
         logger.warning(f"情绪分析 JSON 解析失败: {Path(image_path).name}")
-    return parsed or {
-        "primary_emotion": "未知", "emotion_intensity": 5,
-        "mood_keywords": [], "suitable_copywriting_style": "文艺",
-    }
+    default = EmotionAnalysis()
+    return EmotionAnalysis(
+        primary_emotion=parsed.get("primary_emotion", default.primary_emotion),
+        emotion_intensity=float(parsed.get("emotion_intensity", default.emotion_intensity)),
+        mood_keywords=parsed.get("mood_keywords", default.mood_keywords),
+        suitable_copywriting_style=parsed.get("suitable_copywriting_style", default.suitable_copywriting_style),
+    )
 
 
 async def generate_copywriting(image_path: str | Path, platform: str = "xiaohongshu") -> str:
@@ -165,7 +171,7 @@ async def generate_copywriting(image_path: str | Path, platform: str = "xiaohong
     return (await _call_api(prompt, image_path)).strip()
 
 
-async def deep_analyze(image_path: str | Path, platform: str = "xiaohongshu") -> dict:
+async def deep_analyze(image_path: str | Path, platform: str = "xiaohongshu") -> Layer5Result:
     """单张深度分析（5 个并行 API 调用）"""
     results = await asyncio.gather(
         classify_photo(image_path),
@@ -176,30 +182,31 @@ async def deep_analyze(image_path: str | Path, platform: str = "xiaohongshu") ->
         return_exceptions=True,
     )
 
-    return {
-        "path": str(image_path),
-        "filename": Path(image_path).name,
-        "classification": results[0] if not isinstance(results[0], Exception) else "API 调用失败",
-        "composition": results[1] if not isinstance(results[1], Exception) else "API 调用失败",
-        "improvement": results[2] if not isinstance(results[2], Exception) else "API 调用失败",
-        "emotion": results[3] if not isinstance(results[3], Exception) else {},
-        "copywriting": results[4] if not isinstance(results[4], Exception) else "API 调用失败",
-        "platform": platform,
-    }
+    default_emotion = EmotionAnalysis()
+    return Layer5Result(
+        path=str(image_path),
+        filename=Path(image_path).name,
+        classification=results[0] if not isinstance(results[0], Exception) else "API 调用失败",
+        composition=results[1] if not isinstance(results[1], Exception) else "API 调用失败",
+        improvement=results[2] if not isinstance(results[2], Exception) else "API 调用失败",
+        emotion=results[3] if not isinstance(results[3], Exception) else default_emotion,
+        copywriting=results[4] if not isinstance(results[4], Exception) else "API 调用失败",
+        platform=platform,
+    )
 
 
 async def batch_deep_analyze(
     image_paths: list[str | Path], platform: str = "xiaohongshu",
-) -> list[dict]:
+) -> list[Layer5Result]:
     """批量深度分析（并行处理所有照片）"""
     tasks = [deep_analyze(p, platform) for p in image_paths]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return [
-        r if not isinstance(r, Exception) else {
-            "path": str(image_paths[i]), "filename": Path(image_paths[i]).name,
-            "classification": "分析失败", "composition": str(r),
-            "improvement": str(r), "emotion": {}, "copywriting": "分析失败",
-            "platform": platform,
-        }
+        r if not isinstance(r, Exception) else Layer5Result(
+            path=str(image_paths[i]), filename=Path(image_paths[i]).name,
+            classification="分析失败", composition=str(r),
+            improvement=str(r), copywriting="分析失败",
+            platform=platform,
+        )
         for i, r in enumerate(results)
     ]

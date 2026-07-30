@@ -5,8 +5,9 @@
 - 运行时类型校验
 - JSON 序列化兼容
 """
-from pydantic import BaseModel, Field
 from typing import Optional
+
+from pydantic import BaseModel
 
 
 class Layer1Result(BaseModel):
@@ -23,9 +24,12 @@ class Layer1Result(BaseModel):
 
 class SimilarityCluster(BaseModel):
     """Layer 2 相似聚类组"""
+    cluster_id: int = 0
     member_count: int = 1
     members: list[str] = []
     representative: str = ""
+    filename: str = ""
+    member_scores: dict[str, float] = {}
 
 
 class Layer3Result(BaseModel):

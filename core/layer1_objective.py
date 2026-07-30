@@ -1,12 +1,15 @@
 """Layer 1: 客观指标 — 清晰度、曝光、噪声（多线程 + HEIC 支持）"""
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+
 import cv2
 import numpy as np
-import logging
-from pathlib import Path
-from dataclasses import dataclass
 from PIL import Image
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from config import LAPLACIAN_THRESHOLD, OVEREXPOSURE_THRESHOLD, UNDEREXPOSURE_THRESHOLD
+from core.models import Layer1Result
 
 logger = logging.getLogger(__name__)
 
@@ -111,10 +114,10 @@ def analyze_image(image_path: str | Path) -> ObjectiveScore:
     )
 
 
-def batch_analyze(image_paths: list[str | Path], max_workers: int = 4) -> list[dict]:
+def batch_analyze(image_paths: list[str | Path], max_workers: int = 4) -> list[Layer1Result]:
     """批量分析照片（多线程）"""
     paths = [str(p) for p in image_paths]
-    results = [None] * len(paths)
+    results: list[Layer1Result | None] = [None] * len(paths)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {executor.submit(analyze_image, p): i for i, p in enumerate(paths)}
@@ -123,25 +126,21 @@ def batch_analyze(image_paths: list[str | Path], max_workers: int = 4) -> list[d
             idx = future_to_idx[future]
             try:
                 score = future.result()
-                results[idx] = {
-                    "path": paths[idx],
-                    "filename": Path(paths[idx]).name,
-                    "sharpness": round(score.sharpness, 2),
-                    "exposure": round(score.exposure, 4),
-                    "noise": round(score.noise, 4),
-                    "overall": round(score.overall, 4),
-                    "is_blurry": score.is_blurry,
-                    "is_overexposed": score.is_overexposed,
-                    "is_underexposed": score.is_underexposed,
-                    "rejected": score.rejected,
-                    "reject_reason": score.reject_reason,
-                }
+                results[idx] = Layer1Result(
+                    path=paths[idx],
+                    filename=Path(paths[idx]).name,
+                    sharpness=round(score.sharpness, 2),
+                    exposure=round(score.exposure, 4),
+                    noise=round(score.noise, 4),
+                    overall=round(score.overall, 4),
+                    rejected=score.rejected,
+                    reject_reason=score.reject_reason,
+                )
             except Exception as e:
                 logger.error(f"分析失败 {Path(paths[idx]).name}: {e}")
-                results[idx] = {
-                    "path": paths[idx], "filename": Path(paths[idx]).name,
-                    "sharpness": 0, "exposure": 0, "noise": 0, "overall": 0,
-                    "rejected": True, "reject_reason": "分析异常",
-                }
+                results[idx] = Layer1Result(
+                    path=paths[idx], filename=Path(paths[idx]).name,
+                    rejected=True, reject_reason="分析异常",
+                )
 
-    return results
+    return [r for r in results if r is not None]

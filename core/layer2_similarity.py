@@ -1,11 +1,13 @@
 """Layer 2: 相似聚类 — 感知哈希 + Union-Find"""
 import logging
-from pathlib import Path
 from dataclasses import dataclass
-from PIL import Image
-import imagehash
-from config import HAMMING_THRESHOLD
+from pathlib import Path
 
+import imagehash
+from PIL import Image
+
+from config import HAMMING_THRESHOLD
+from core.models import SimilarityCluster as SimilarityClusterModel
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +56,9 @@ def cluster_photos(
     image_paths: list[str | Path],
     sharpness_scores: dict[str, float],
     threshold: int = HAMMING_THRESHOLD,
-) -> list[dict]:
+) -> list[SimilarityClusterModel]:
     """将相似照片聚类（Union-Find + 感知哈希）"""
     paths = [str(p) for p in image_paths]
-    n = len(paths)
 
     # 计算哈希（保留失败的照片不丢失）
     hashes = {}
@@ -89,28 +90,28 @@ def cluster_photos(
         groups[root].append(p)
 
     # 构建结果
-    clusters = []
+    clusters: list[SimilarityClusterModel] = []
     for root, members in groups.items():
         best = max(members, key=lambda p: sharpness_scores.get(p, 0))
-        clusters.append({
-            "cluster_id": len(clusters),
-            "representative": best,
-            "filename": Path(best).name,
-            "members": members,
-            "member_count": len(members),
-            "member_scores": {p: sharpness_scores.get(p, 0) for p in members},
-        })
+        clusters.append(SimilarityClusterModel(
+            cluster_id=len(clusters),
+            representative=best,
+            filename=Path(best).name,
+            members=members,
+            member_count=len(members),
+            member_scores={p: sharpness_scores.get(p, 0) for p in members},
+        ))
 
     # 失败的照片各成一个独立簇
     for p in failed:
-        clusters.append({
-            "cluster_id": len(clusters),
-            "representative": p,
-            "filename": Path(p).name,
-            "members": [p],
-            "member_count": 1,
-            "member_scores": {p: sharpness_scores.get(p, 0)},
-        })
+        clusters.append(SimilarityClusterModel(
+            cluster_id=len(clusters),
+            representative=p,
+            filename=Path(p).name,
+            members=[p],
+            member_count=1,
+            member_scores={p: sharpness_scores.get(p, 0)},
+        ))
         logger.debug(f"哈希失败，独立簇: {Path(p).name}")
 
     return clusters

@@ -10,7 +10,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 import uvicorn
-from config import HOST, PORT
+# ─────────────────────────────────────────────────────────
+# 统一从 config.py 导入配置，消除重复定义
+# ─────────────────────────────────────────────────────────
+from config import (
+    PROJECT_ROOT,
+    PHOTOS_DIR as UPLOADS_DIR,   # config.py 中命名为 PHOTOS_DIR
+    OUTPUT_DIR,
+    HOST,
+    PORT,
+)
 from core.logger import setup_logging, get_logger
 
 setup_logging()
@@ -21,11 +30,27 @@ app = FastAPI(title="PhotoRank")
 # 并发控制
 _analysis_lock = asyncio.Lock()
 
-# 配置
-BASE_DIR = Path(__file__).parent
-UPLOADS_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "output"
-TEMPLATES_DIR = BASE_DIR / "templates"
+# config.py 未定义 TEMPLATES_DIR，仅本地定义
+TEMPLATES_DIR = PROJECT_ROOT / "templates"
+
+# ─────────────────────────────────────────────────────────
+# P0 安全常量 — 不可删除
+# ─────────────────────────────────────────────────────────
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
+ALLOWED_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/bmp",
+    "image/webp", "image/heic", "image/heif",
+}
+
+
+def secure_filename(filename: str) -> str:
+    """防路径遍历：去除目录片段，返回安全文件名"""
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    parts = [p for p in name.split("/") if p and p != ".."]
+    safe = "_".join(parts) if parts else "unnamed"
+    return safe
+
 
 UPLOADS_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -47,8 +72,8 @@ class ConnectionManager:
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"[WebSocket] 广播消息失败: {e}")
 
 manager = ConnectionManager()
 
@@ -67,35 +92,48 @@ async def index():
 
 @app.post("/api/upload")
 async def upload_photos(files: list[UploadFile] = File(...)):
-    """上传照片"""
+    """上传照片（含安全校验）"""
     uploaded = []
     for file in files:
         if not file.filename:
             continue
-        
-        # 生成唯一文件名
-        import hashlib
-        ext = Path(file.filename).suffix
+
+        safe_name = secure_filename(file.filename)
+        ext = Path(safe_name).suffix.lower()
+
+        # 扩展名白名单
+        if ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
+
+        # MIME 类型白名单
+        if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
+            raise HTTPException(status_code=400, detail=f"不支持的 MIME 类型: {file.content_type}")
+
         content = await file.read()
+
+        # 文件大小限制
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail=f"文件过大，最大允许 {MAX_UPLOAD_SIZE // (1024 * 1024)} MB")
+
+        # 用内容哈希生成唯一文件名
+        import hashlib
         filename = hashlib.md5(content).hexdigest()[:8] + ext
-        
-        # 保存文件
+
         filepath = UPLOADS_DIR / filename
         with open(filepath, "wb") as f:
             f.write(content)
-        
+
         uploaded.append({
             "filename": filename,
             "original_name": file.filename,
             "size": len(content),
         })
-    
-    # 广播上传完成
+
     await manager.broadcast({
         "type": "upload_complete",
         "count": len(uploaded),
     })
-    
+
     return {"uploaded": uploaded, "total": len(uploaded)}
 
 
@@ -115,7 +153,10 @@ async def list_photos():
 
 @app.get("/api/photos/{filename}")
 async def get_photo(filename: str):
-    """获取照片"""
+    """获取照片（含路径遍历防护）"""
+    safe_name = secure_filename(filename)
+    if safe_name != filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
     filepath = UPLOADS_DIR / filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="照片不存在")
@@ -124,7 +165,10 @@ async def get_photo(filename: str):
 
 @app.delete("/api/photos/{filename}")
 async def delete_photo(filename: str):
-    """删除照片"""
+    """删除照片（含路径遍历防护）"""
+    safe_name = secure_filename(filename)
+    if safe_name != filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
     filepath = UPLOADS_DIR / filename
     if filepath.exists():
         filepath.unlink()
@@ -133,20 +177,29 @@ async def delete_photo(filename: str):
 
 @app.get("/api/results/{platform}")
 async def get_results(platform: str):
-    """获取分析结果"""
+    """获取分析结果（含路径遍历防护）"""
+    safe_platform = secure_filename(platform)
+    if safe_platform != platform:
+        raise HTTPException(status_code=400, detail="非法平台名")
     ranking_file = OUTPUT_DIR / platform / "ranking.json"
     if not ranking_file.exists():
         raise HTTPException(status_code=404, detail="未找到分析结果")
-    
+
     with open(ranking_file, "r", encoding="utf-8") as f:
         data = json.load(f)
-    
+
     return {"results": data, "total": len(data)}
 
 
 @app.get("/api/results/{platform}/{filename}")
 async def get_result_photo(platform: str, filename: str):
-    """获取结果照片"""
+    """获取结果照片（含路径遍历防护）"""
+    safe_platform = secure_filename(platform)
+    if safe_platform != platform:
+        raise HTTPException(status_code=400, detail="非法平台名")
+    safe_filename = secure_filename(filename)
+    if safe_filename != filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
     filepath = OUTPUT_DIR / platform / filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="照片不存在")
@@ -186,7 +239,7 @@ async def analyze_photos(platform: str = "xiaohongshu"):
             })
             return result
         except Exception as e:
-            print(f"[Analyze] 分析流水线异常: {e}")
+            logger.error(f"[Analyze] 分析流水线异常: {e}")
             await manager.broadcast({"type": "analysis_error", "error": "分析过程出现内部错误，请稍后重试"})
             raise HTTPException(status_code=500, detail="服务器内部错误")
 

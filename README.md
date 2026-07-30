@@ -1,14 +1,20 @@
 # 📸 PhotoRank — 旅行照片 AI 智能筛选平台
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+
 > 从大量旅行照片中，自动筛出适合发小红书/朋友圈/抖音的优质照片。
 
 ## ✨ 特性
 
-- **5 层本地模型流水线** — 逐层筛选，每层可验证
+- **5 层本地模型流水线** — 客观指标 → 相似聚类 → 审美评分 → 人脸质量 → 深度分析，逐层筛选可验证
 - **RTX 5070 CUDA 加速** — 审美评分 GPU 推理
-- **Web UI** — 拖拽上传、实时进度、详情查看
+- **Web UI** — 拖拽上传、WebSocket 实时进度、详情查看
 - **平台适配** — 小红书/朋友圈/抖音独立评分
-- **深度分析** — Qwen-VL API 分类/构图/改进/文案
+- **深度分析** — Qwen-VL API 分类/构图/改进/情绪/文案
+- **安全可靠** — 路径遍历防护、文件类型校验、上传大小限制
+- **工程质量** — 44 个单元测试、Pydantic 数据模型、ruff 代码风格检查
 
 ## 🏗️ 架构
 
@@ -29,6 +35,19 @@ Top 12
     ↓   分类/构图/改进/情绪/文案
 输出：精选照片 + 评分 + 文案
 ```
+
+<details>
+<summary>五层流水线详情</summary>
+
+| 层级 | 功能 | 核心技术 | 说明 |
+|------|------|----------|------|
+| Layer 1 | 客观指标 | OpenCV（CPU） | 清晰度（拉普拉斯方差）、曝光（直方图分析）、噪声（信噪比） |
+| Layer 2 | 相似聚类 | pHash（CPU） | 感知哈希 + 汉明距离聚类，每组选最清晰代表 |
+| Layer 3 | 审美评分 | NIMA-VGG16（GPU） | AVA 数据集训练，SRCC 0.71，1-10 分评分 |
+| Layer 4 | 人脸质量 | MediaPipe（CPU） | 478 关键点 + 52 blendshape，闭眼/微笑/人脸清晰度检测 |
+| Layer 5 | 深度分析 | Qwen-VL Max API | 分类（8 类）、构图解读、改进建议、情绪图谱、平台定制文案 |
+
+</details>
 
 ## 🚀 快速开始
 
@@ -94,11 +113,17 @@ photo-rank/
 │   ├── layer3_aesthetic.py      # Layer 3: 审美评分（NIMA-VGG16）
 │   ├── layer4_face.py           # Layer 4: 人脸质量（MediaPipe）
 │   ├── layer5_analysis.py       # Layer 5: 深度分析（Qwen-VL）
+│   ├── models.py                # Pydantic 数据模型
+│   ├── logger.py                # 日志模块
 │   └── pipeline.py              # 流水线整合
 ├── main.py                      # Web UI 启动
 ├── config.py                    # 配置文件
 ├── templates/
 │   └── index.html               # 前端 UI
+├── tests/                       # 单元测试（44 个）
+│   ├── test_config.py
+│   ├── test_layer1.py
+│   └── test_layer2.py
 ├── docs/
 │   └── research/                # 研究报告
 │       ├── photo_aesthetic_models_research.md
@@ -107,6 +132,7 @@ photo-rank/
 │       └── web_ui_framework_research.md
 ├── uploads/                     # 上传的照片
 ├── output/                      # 分析结果
+├── pyproject.toml               # 项目配置（ruff 等）
 ├── requirements.txt             # 依赖
 ├── .gitignore
 └── README.md
@@ -164,7 +190,14 @@ photo-rank/
 ### 运行测试
 
 ```bash
-python -m pytest tests/
+# 运行全部测试（44 个）
+python -m pytest tests/ -v
+
+# 代码风格检查
+ruff check .
+
+# 自动修复代码风格
+ruff check . --fix
 ```
 
 ### 添加新平台
@@ -190,6 +223,14 @@ model = pyiqa.create_metric('your_model_name', device='cuda')
 ```
 
 ## 📝 更新日志
+
+### v1.1.0 (2026-07-30)
+
+- ✅ 安全加固：路径遍历防护、文件类型校验、上传大小限制
+- ✅ Pydantic 数据模型集成（`core/models.py`）
+- ✅ 44 个单元测试覆盖
+- ✅ ruff 代码风格检查
+- ✅ WebSocket 实时进度推送
 
 ### v1.0.0 (2026-07-29)
 

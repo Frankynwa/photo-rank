@@ -35,7 +35,7 @@ QWEN_BASE_URL = os.environ.get(
     "QWEN_BASE_URL",
     "https://llm-1r8e612iutxlixav.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
 )
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-vl-max")
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen3-vl-max")
 
 # 代理（通过环境变量 HTTPS_PROXY 自动获取）
 PROXY = os.environ.get("HTTPS_PROXY", "")

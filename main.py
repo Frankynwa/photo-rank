@@ -164,10 +164,12 @@ async def analyze_photos(platform: str = "xiaohongshu"):
         from core.pipeline import run_pipeline
 
         try:
+            loop = asyncio.get_running_loop()
+
             def progress_callback(event: str, data: dict):
                 asyncio.run_coroutine_threadsafe(
                     manager.broadcast({"type": event, **data}),
-                    asyncio.get_event_loop(),
+                    loop,
                 )
 
             result = await asyncio.to_thread(
@@ -184,7 +186,8 @@ async def analyze_photos(platform: str = "xiaohongshu"):
             })
             return result
         except Exception as e:
-            await manager.broadcast({"type": "analysis_error", "error": str(e)})
+            print(f"[Analyze] 分析流水线异常: {e}")
+            await manager.broadcast({"type": "analysis_error", "error": "分析过程出现内部错误，请稍后重试"})
             raise HTTPException(status_code=500, detail="服务器内部错误")
 
 

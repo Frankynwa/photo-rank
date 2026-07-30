@@ -1,0 +1,53 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: master
+nodes_managed: true
+exported_at: "2026-07-29T16:42:46Z"
+modules:
+    "":
+        dir_name: PhotoRank 旅行照片 AI 智能筛选平台（根项目）
+        title: PhotoRank 旅行照片 AI 智能筛选平台（根项目）
+        scope:
+            - CONTRIBUTING.md
+            - .gitignore
+            - requirements.txt
+            - CHANGELOG.md
+            - LICENSE
+            - README.md
+        source_files: []
+        children:
+            - core_pipeline
+            - docs
+            - web_ui
+        depends_on: []
+        related_to: []
+    core_pipeline:
+        dir_name: PhotoRank 核心五层筛选流水线
+        title: PhotoRank 核心五层筛选流水线
+        scope:
+            - core/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    docs:
+        dir_name: 项目文档与研究资料（Wiki 与研究报告）
+        title: 项目文档与研究资料（Wiki 与研究报告）
+        scope:
+            - docs/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
+    web_ui:
+        dir_name: PhotoRank Web UI（FastAPI 前端服务）
+        title: PhotoRank Web UI（FastAPI 前端服务）
+        scope:
+            - main.py
+            - config.py
+            - templates/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

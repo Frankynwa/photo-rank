@@ -1,5 +1,25 @@
 # PhotoRank 改进执行手册
 
+> **⚠️ 不可变约束 — 任何 agent 修改 main.py 前必读**
+>
+> 以下安全修复已验证，**任何后续修改必须保留，禁止删除或重写**：
+>
+> | 约束 | 位置 | 说明 |
+> |------|------|------|
+> | `secure_filename()` 函数 | main.py | 防路径遍历，所有接受文件名参数的路由必须调用 |
+> | `MAX_UPLOAD_SIZE = 50 * 1024 * 1024` | main.py | 上传文件大小限制 |
+> | `ALLOWED_EXTENSIONS` 白名单 | main.py | 只允许图片扩展名 |
+> | `ALLOWED_MIME_TYPES` 白名单 | main.py | 只允许图片 MIME 类型 |
+> | `asyncio.to_thread()` | main.py | 同步代码不阻塞事件循环 |
+> | HTTP 500 错误脱敏 | main.py | 不向客户端泄露内部堆栈 |
+> | `from config import ...` 统一配置 | main.py | 禁止本地重复定义 BASE_DIR 等 |
+> | `except Exception as e:` | 全项目 | 禁止裸 `except:` 或 `except: pass` |
+> | `dotenv + os.environ` 读配置 | layer5_analysis.py, config.py | 禁止硬编码路径读取密钥 |
+>
+> **违反以上约束的 commit 将被拒绝。**
+
+---
+
 ## 概览
 
 PhotoRank 是一个 Python 旅行照片 AI 智能筛选平台，采用五层流水线架构（客观指标 → 相似聚类 → 审美评分 → 人脸质量 → 深度分析）。项目刚完成了一轮 **P0 级紧急修复**，解决了安全漏洞、配置硬编码、依赖缺失和 asyncio 阻塞等关键问题。当前代码可以正常运行，但在工程健壮性、模型精度、架构设计等方面仍有较大提升空间。

@@ -1,6 +1,7 @@
 """Layer 4: 人脸质量 — MediaPipe Face Landmarker"""
 import os
 import time
+import threading
 import logging
 import urllib.request
 from pathlib import Path
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 # 全局缓存：避免每次调用都创建新实例
 _global_analyzer = None
+_global_analyzer_lock = threading.Lock()
 
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 EXPECTED_SIZE = 3 * 1024 * 1024  # ~3MB
@@ -181,6 +183,7 @@ class FaceAnalyzer:
 def analyze_faces(image_paths: list[str | Path]) -> list[dict]:
     """批量人脸分析（复用全局实例）"""
     global _global_analyzer
-    if _global_analyzer is None:
-        _global_analyzer = FaceAnalyzer()
+    with _global_analyzer_lock:
+        if _global_analyzer is None:
+            _global_analyzer = FaceAnalyzer()
     return _global_analyzer.batch_analyze(image_paths)

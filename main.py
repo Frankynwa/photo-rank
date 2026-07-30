@@ -1,14 +1,9 @@
 """PhotoRank Web UI — FastAPI + 原生 HTML/JS"""
-import os
 import json
-import shutil
 import asyncio
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from starlette.requests import Request
+from fastapi.responses import HTMLResponse, FileResponse
 import uvicorn
 # ─────────────────────────────────────────────────────────
 # 统一从 config.py 导入配置，消除重复定义

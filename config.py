@@ -23,8 +23,8 @@ OVEREXPOSURE_THRESHOLD = 240
 UNDEREXPOSURE_THRESHOLD = 15
 
 # Layer 2: 相似聚类（汉明距离，对应 config 的语义阈值）
-SIMILARITY_THRESHOLD = 0.85  # 余弦相似度（备用）
-HAMMING_THRESHOLD = 10       # 感知哈希汉明距离
+SIMILARITY_THRESHOLD = 0.85  # 余弦相似度（备用，当前未被任何模块引用）
+HAMMING_THRESHOLD = 10       # 感知哈希汉明距离（layer2_similarity.py 使用）
 
 # Layer 3/5 共用
 TOP_K_PER_CATEGORY = 5

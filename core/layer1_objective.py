@@ -141,7 +141,7 @@ def batch_analyze(image_paths: list[str | Path], max_workers: int = 4) -> list[d
                 results[idx] = {
                     "path": paths[idx], "filename": Path(paths[idx]).name,
                     "sharpness": 0, "exposure": 0, "noise": 0, "overall": 0,
-                    "rejected": False, "reject_reason": f"分析异常: {e}",
+                    "rejected": True, "reject_reason": "分析异常",
                 }
 
     return results

@@ -6,6 +6,7 @@ import os
 import base64
 import json
 import asyncio
+import threading
 import logging
 from pathlib import Path
 from PIL import Image
@@ -18,28 +19,30 @@ logger = logging.getLogger(__name__)
 
 # API Key 缓存
 _api_key_cache: str | None = None
+_api_key_lock = threading.Lock()
 
 
 def get_api_key() -> str:
     """获取 Qwen API Key（带缓存）"""
     global _api_key_cache
-    if _api_key_cache:
-        return _api_key_cache
+    with _api_key_lock:
+        if _api_key_cache:
+            return _api_key_cache
 
-    api_key = os.environ.get("QWEN_API_KEY")
-    if api_key:
-        _api_key_cache = api_key
-        return api_key
+        api_key = os.environ.get("QWEN_API_KEY")
+        if api_key:
+            _api_key_cache = api_key
+            return api_key
 
-    load_dotenv()
-    api_key = os.environ.get("QWEN_API_KEY")
-    if api_key:
-        _api_key_cache = api_key
-        return api_key
+        load_dotenv()
+        api_key = os.environ.get("QWEN_API_KEY")
+        if api_key:
+            _api_key_cache = api_key
+            return api_key
 
-    raise ValueError(
-        "找不到 QWEN_API_KEY！请设置环境变量或在项目根目录创建 .env 文件"
-    )
+        raise ValueError(
+            "找不到 QWEN_API_KEY！请设置环境变量或在项目根目录创建 .env 文件"
+        )
 
 
 def encode_image(image_path: str | Path, max_size: int = 1024) -> str:

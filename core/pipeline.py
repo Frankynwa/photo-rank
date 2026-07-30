@@ -1,4 +1,4 @@
-"""Pipeline — 整合所有层的完整流水线（RTX 5070 CUDA）"""
+"""Pipeline — 整合所有层的完整流水线（支持 GPU/CPU 自动切换）"""
 import asyncio
 import json
 import shutil

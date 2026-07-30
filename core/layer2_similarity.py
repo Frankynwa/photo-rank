@@ -4,12 +4,10 @@ from pathlib import Path
 from dataclasses import dataclass
 from PIL import Image
 import imagehash
-from config import LAPLACIAN_THRESHOLD
+from config import HAMMING_THRESHOLD
+
 
 logger = logging.getLogger(__name__)
-
-# 汉明距离阈值（与 config.py SIMILARITY_THRESHOLD 的语义对应）
-HAMMING_THRESHOLD = 10
 
 
 @dataclass

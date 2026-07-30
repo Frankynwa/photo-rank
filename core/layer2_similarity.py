@@ -1,4 +1,6 @@
-"""Layer 2: 相似聚类 — 感知哈希 + Union-Find"""
+"""Layer 2: 相似聚类 — 感知哈希 + BK-Tree + Union-Find"""
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +13,9 @@ from core.models import SimilarityCluster as SimilarityClusterModel
 
 logger = logging.getLogger(__name__)
 
+# BK-Tree 小数据集 fallback 阈值
+_BK_TREE_FALLBACK_SIZE = 50
+
 
 @dataclass
 class SimilarityCluster:
@@ -18,6 +23,119 @@ class SimilarityCluster:
     representative: str
     members: list[str]
     member_scores: dict[str, float]
+
+
+class _BKTree:
+    """BK-Tree：用于汉明距离空间的高效近邻搜索
+
+    插入: O(log n) 均摊
+    范围查询 (distance ≤ threshold): O(log n) 均摊
+    """
+
+    __slots__ = ("_hash", "_children")
+
+    def __init__(self, hash_val: imagehash.ImageHash):
+        self._hash = hash_val
+        # dict[int, _BKTree] — 距离 -> 子节点
+        self._children: dict[int, _BKTree] = {}
+
+    @property
+    def hash(self) -> imagehash.ImageHash:
+        return self._hash
+
+    def insert(self, other: imagehash.ImageHash) -> None:
+        dist = int(self._hash - other)
+        if dist == 0:
+            # 哈希完全相同，挂在 distance=0 子树
+            if 0 in self._children:
+                self._children[0].insert(other)
+            else:
+                self._children[0] = _BKTree(other)
+            return
+        if dist in self._children:
+            self._children[dist].insert(other)
+        else:
+            self._children[dist] = _BKTree(other)
+
+    def query(self, target: imagehash.ImageHash, threshold: int) -> list[imagehash.ImageHash]:
+        """返回树中所有与 target 距离 ≤ threshold 的哈希列表"""
+        results: list[imagehash.ImageHash] = []
+        self._query_recursive(target, threshold, results)
+        return results
+
+    def _query_recursive(
+        self,
+        target: imagehash.ImageHash,
+        threshold: int,
+        results: list[imagehash.ImageHash],
+    ) -> None:
+        dist = int(self._hash - target)
+        if dist <= threshold:
+            results.append(self._hash)
+        # BK-Tree 三角不等式剪枝：只需搜索 [dist-threshold, dist+threshold] 范围内的子树
+        lo, hi = dist - threshold, dist + threshold
+        for d, child in self._children.items():
+            if lo <= d <= hi:
+                child._query_recursive(target, threshold, results)
+
+
+def _build_bktree(hashes: list[imagehash.ImageHash]) -> _BKTree | None:
+    """从哈希列表构建 BK-Tree，返回根节点"""
+    if not hashes:
+        return None
+    root = _BKTree(hashes[0])
+    for h in hashes[1:]:
+        root.insert(h)
+    return root
+
+
+def _brute_force_pairs(
+    valid: list[str],
+    hashes: dict[str, imagehash.ImageHash],
+    threshold: int,
+    uf: _UnionFind,
+) -> None:
+    """暴力 O(n²) 两两比较（小数据集 fallback）"""
+    m = len(valid)
+    for i in range(m):
+        for j in range(i + 1, m):
+            if hashes[valid[i]] - hashes[valid[j]] <= threshold:
+                uf.union(i, j)
+
+
+def _bktree_pairs(
+    valid: list[str],
+    hashes: dict[str, imagehash.ImageHash],
+    threshold: int,
+    uf: _UnionFind,
+) -> None:
+    """使用 BK-Tree 进行范围查询，避免 O(n²) 全量比较"""
+    hash_list = [hashes[p] for p in valid]
+    tree = _build_bktree(hash_list)
+    if tree is None:
+        return
+
+    # 预建哈希值 -> 索引列表 的映射，加速重复哈希查找
+    hash_to_indices: dict[str, list[int]] = {}
+    for i, h in enumerate(hash_list):
+        key = str(h)
+        if key not in hash_to_indices:
+            hash_to_indices[key] = []
+        hash_to_indices[key].append(i)
+
+    # 对每张照片，用 BK-Tree 查找距离 ≤ threshold 的邻居
+    seen_pairs: set[tuple[int, int]] = set()
+    for i, p in enumerate(valid):
+        neighbors = tree.query(hashes[p], threshold)
+        for nh in neighbors:
+            nh_key = str(nh)
+            for j in hash_to_indices.get(nh_key, []):
+                if j == i:
+                    continue
+                pair = (min(i, j), max(i, j))
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    uf.union(i, j)
 
 
 class _UnionFind:
@@ -75,11 +193,13 @@ def cluster_photos(
     m = len(valid)
     uf = _UnionFind(m)
 
-    for i in range(m):
-        for j in range(i + 1, m):
-            distance = hashes[valid[i]] - hashes[valid[j]]
-            if distance <= threshold:
-                uf.union(i, j)
+    if m < _BK_TREE_FALLBACK_SIZE:
+        # 小数据集：暴力搜索开销更低
+        _brute_force_pairs(valid, hashes, threshold, uf)
+    else:
+        # 大数据集：BK-Tree 范围查询 O(n log n)
+        logger.info(f"照片数量 {m} ≥ {_BK_TREE_FALLBACK_SIZE}，启用 BK-Tree 索引")
+        _bktree_pairs(valid, hashes, threshold, uf)
 
     # 分组
     groups = {}

@@ -5,6 +5,8 @@ import logging
 import shutil
 from pathlib import Path
 
+import imagehash
+
 from config import FINAL_OUTPUT_COUNT, OUTPUT_DIR, PHOTOS_DIR
 from core.models import (
     FinalResult,
@@ -262,10 +264,52 @@ def run_pipeline(
         reverse=True,
     )
 
-    # ── Layer 5: 深度分析 ──
-    top_n = min(FINAL_OUTPUT_COUNT, len(aes_results))
-    top_photos = aes_results[:top_n]
+    # ── 多样性过滤：同场景照片只保留最好的一张 ──
+    DIVERSITY_THRESHOLD = 8  # pHash 汉明距离阈值，越小越严格
 
+    def _is_diverse(photo_path: str, selected_paths: list[str], hash_cache: dict) -> bool:
+        """检查照片是否与已选照片足够不同"""
+        from core.layer2_similarity import compute_phash
+
+        if photo_path not in hash_cache:
+            hash_cache[photo_path] = compute_phash(photo_path)
+        new_hash = hash_cache[photo_path]
+        if new_hash is None:
+            return True  # 无法计算哈希，默认保留
+
+        for selected_path in selected_paths:
+            if selected_path not in hash_cache:
+                hash_cache[selected_path] = compute_phash(selected_path)
+            existing_hash = hash_cache[selected_path]
+            if existing_hash is None:
+                continue
+            distance = abs(int(new_hash - existing_hash))
+            if distance < DIVERSITY_THRESHOLD:
+                return False  # 太相似，跳过
+        return True
+
+    # 多样性选择
+    top_n = min(FINAL_OUTPUT_COUNT, len(aes_results))
+    hash_cache: dict[str, imagehash.ImageHash] = {}
+    diverse_top: list = []
+    for r in aes_results:
+        if len(diverse_top) >= top_n:
+            break
+        if _is_diverse(r.path, [d.path for d in diverse_top], hash_cache):
+            diverse_top.append(r)
+
+    # 如果多样性过滤后不足 top_n，用剩余照片补齐
+    if len(diverse_top) < top_n:
+        diverse_paths = {d.path for d in diverse_top}
+        for r in aes_results:
+            if r.path not in diverse_paths:
+                diverse_top.append(r)
+            if len(diverse_top) >= top_n:
+                break
+
+    top_photos = diverse_top
+
+    # ── Layer 5: 深度分析 ──
     if checkpoint and checkpoint["completed_layer"] >= 5:
         deep_results = [Layer5Result(**r) for r in checkpoint["deep_results"]]
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)

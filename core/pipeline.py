@@ -174,6 +174,9 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
+    # 建立 Layer 1 客观分映射（0-1 范围）
+    l1_scores = {r.path: r.overall for r in kept}
+
     # ── Layer 2: 相似聚类 ──
     if checkpoint and checkpoint["completed_layer"] >= 2:
         clusters = [SimilarityCluster(**c) for c in checkpoint["clusters"]]
@@ -246,9 +249,16 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
-    # 综合排序（基于 overall_score + 人脸加分）
+    # 综合排序：客观分×0.2 + 审美分×0.6 + 人脸分×0.2
+    # Layer 1 overall: 0-1 范围
+    # Layer 3 overall_score: 0-10 范围（需归一化到 0-1）
+    # Layer 4 overall_face_score: 0-1 范围
     aes_results.sort(
-        key=lambda x: x.overall_score + face_scores.get(x.path, 0) * 0.1,
+        key=lambda x: (
+            l1_scores.get(x.path, 0.5) * 0.2 +  # 客观分（默认 0.5）
+            (x.overall_score / 10.0) * 0.6 +     # 审美分（归一化到 0-1）
+            face_scores.get(x.path, 0) * 0.2     # 人脸分
+        ),
         reverse=True,
     )
 
@@ -301,7 +311,11 @@ def run_pipeline(
             filename=r.filename,
             aesthetic_score=r.aesthetic_score,
             overall_score=r.overall_score,
-            final_score=r.overall_score + face_scores.get(r.path, 0) * 0.1,
+            final_score=(
+                l1_scores.get(r.path, 0.5) * 0.2 +
+                (r.overall_score / 10.0) * 0.6 +
+                face_scores.get(r.path, 0) * 0.2
+            ) * 10,  # 放大到 0-10 范围便于展示
             deep_analysis=deep,
         ))
 

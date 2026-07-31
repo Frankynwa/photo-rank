@@ -63,7 +63,7 @@ class TestDeviceSelection:
             p = _make_random_image(tmp_path / "cuda.png")
             results = score_photos([p], device="auto")
 
-        mock_pyiqa.create_metric.assert_called_once_with("topiq-iaa", device="cuda")
+        mock_pyiqa.create_metric.assert_called_once_with("topiq_iaa", device="cuda")
         assert results[0].device == "cuda"
 
     def test_auto_falls_back_to_cpu(self, tmp_path):
@@ -74,7 +74,7 @@ class TestDeviceSelection:
             p = _make_random_image(tmp_path / "cpu.png")
             results = score_photos([p], device="auto")
 
-        mock_pyiqa.create_metric.assert_called_once_with("topiq-iaa", device="cpu")
+        mock_pyiqa.create_metric.assert_called_once_with("topiq_iaa", device="cpu")
         assert results[0].device == "cpu"
 
     def test_explicit_device_overrides_auto(self, tmp_path):
@@ -86,7 +86,7 @@ class TestDeviceSelection:
             score_photos([p], device="cpu")
 
         mock_torch.cuda.is_available.assert_not_called()
-        mock_pyiqa.create_metric.assert_called_once_with("topiq-iaa", device="cpu")
+        mock_pyiqa.create_metric.assert_called_once_with("topiq_iaa", device="cpu")
 
 
 # ---------------------------------------------------------------------------

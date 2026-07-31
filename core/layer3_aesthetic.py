@@ -29,14 +29,14 @@ def score_photos(
     # 加载模型（带容错 + CPU fallback）
     try:
         logger.info("加载 TOPIQ-IAA...")
-        model = pyiqa.create_metric("topiq-iaa", device=device)
+        model = pyiqa.create_metric("topiq_iaa", device=device)
         logger.info("模型加载成功")
     except Exception as e:
         logger.error(f"模型加载失败: {e}")
         if device != "cpu":
             try:
                 logger.info("尝试 CPU fallback...")
-                model = pyiqa.create_metric("topiq-iaa", device="cpu")
+                model = pyiqa.create_metric("topiq_iaa", device="cpu")
                 device = "cpu"
             except Exception as e2:
                 logger.error(f"CPU fallback 也失败: {e2}")

@@ -7,7 +7,14 @@ from pathlib import Path
 
 import imagehash
 
-from config import FINAL_OUTPUT_COUNT, OUTPUT_DIR, PHOTOS_DIR
+from config import (
+    DIVERSITY_DISTANCE_THRESHOLD,
+    DIVERSITY_PENALTY,
+    FINAL_OUTPUT_COUNT,
+    OUTPUT_DIR,
+    PHOTOS_DIR,
+    PLATFORMS,
+)
 from core.models import (
     FinalResult,
     Layer1Result,
@@ -264,50 +271,81 @@ def run_pipeline(
         reverse=True,
     )
 
-    # ── 多样性过滤：同场景照片只保留最好的一张 ──
-    DIVERSITY_THRESHOLD = 8  # pHash 汉明距离阈值，越小越严格
+    # ── 多样性惩罚：对相似照片扣分，避免同场景占据多个名额 ──
 
-    def _is_diverse(photo_path: str, selected_paths: list[str], hash_cache: dict) -> bool:
-        """检查照片是否与已选照片足够不同"""
-        from core.layer2_similarity import compute_phash
+    def _compute_final_score(r) -> float:
+        """计算综合得分（与排序逻辑一致）"""
+        return (
+            l1_scores.get(r.path, 0.5) * 0.2
+            + (r.overall_score / 10.0) * 0.6
+            + face_scores.get(r.path, 0) * 0.2
+        )
 
-        if photo_path not in hash_cache:
-            hash_cache[photo_path] = compute_phash(photo_path)
-        new_hash = hash_cache[photo_path]
-        if new_hash is None:
-            return True  # 无法计算哈希，默认保留
-
-        for selected_path in selected_paths:
-            if selected_path not in hash_cache:
-                hash_cache[selected_path] = compute_phash(selected_path)
-            existing_hash = hash_cache[selected_path]
-            if existing_hash is None:
-                continue
-            distance = abs(int(new_hash - existing_hash))
-            if distance < DIVERSITY_THRESHOLD:
-                return False  # 太相似，跳过
-        return True
-
-    # 多样性选择
-    top_n = min(FINAL_OUTPUT_COUNT, len(aes_results))
-    hash_cache: dict[str, imagehash.ImageHash] = {}
-    diverse_top: list = []
+    # 为所有照片计算 pHash
+    from core.layer2_similarity import compute_phash
+    hash_cache: dict[str, imagehash.ImageHash | None] = {}
     for r in aes_results:
-        if len(diverse_top) >= top_n:
-            break
-        if _is_diverse(r.path, [d.path for d in diverse_top], hash_cache):
-            diverse_top.append(r)
+        hash_cache[r.path] = compute_phash(r.path)
 
-    # 如果多样性过滤后不足 top_n，用剩余照片补齐
-    if len(diverse_top) < top_n:
-        diverse_paths = {d.path for d in diverse_top}
-        for r in aes_results:
-            if r.path not in diverse_paths:
-                diverse_top.append(r)
-            if len(diverse_top) >= top_n:
-                break
+    # 计算原始综合分
+    score_map: dict[str, float] = {r.path: _compute_final_score(r) for r in aes_results}
 
-    top_photos = diverse_top
+    # 找出所有汉明距离 < 阈值的相似对，对每对中排名靠后的扣分
+    penalized: set[str] = set()
+    for i in range(len(aes_results)):
+        hi = hash_cache[aes_results[i].path]
+        if hi is None:
+            continue
+        for j in range(i + 1, len(aes_results)):
+            hj = hash_cache[aes_results[j].path]
+            if hj is None:
+                continue
+            distance = abs(int(hi - hj))
+            if distance < DIVERSITY_DISTANCE_THRESHOLD:
+                penalize_path = aes_results[j].path  # j 排名靠后
+                if penalize_path not in penalized:
+                    score_map[penalize_path] *= (1.0 - DIVERSITY_PENALTY)
+                    penalized.add(penalize_path)
+                    logger.info(
+                        f"[多样性] 对 {Path(penalize_path).name} 施加 "
+                        f"{DIVERSITY_PENALTY*100:.0f}% 扣分"
+                        f"（与 {Path(aes_results[i].path).name} 相似，距离={distance}）"
+                    )
+
+    # 按扣分后的分数重新排序
+    aes_results.sort(key=lambda x: score_map[x.path], reverse=True)
+
+    # ── LLM 终审：从 Top 20 中选出最适合平台的 Top 12 ──
+    top_n = min(FINAL_OUTPUT_COUNT, len(aes_results))
+    CANDIDATE_COUNT = 20  # 候选数量
+    candidates = aes_results[:min(CANDIDATE_COUNT, len(aes_results))]
+
+    # 获取平台权重
+    platform_config = PLATFORMS.get(platform, PLATFORMS["xiaohongshu"])
+    weights = platform_config.get("weights", {
+        "composition": 0.35, "color": 0.30, "lighting": 0.20, "face": 0.15
+    })
+
+    # 计算加权分数
+    def calc_weighted_score(r):
+        return (
+            r.composition_score * weights.get("composition", 0.35)
+            + r.color_score * weights.get("color", 0.30)
+            + r.lighting_score * weights.get("lighting", 0.20)
+            + face_scores.get(r.path, 0) * 10 * weights.get("face", 0.15)  # 人脸分 0-1 → 0-10
+        )
+
+    # 按加权分数排序
+    candidates.sort(key=calc_weighted_score, reverse=True)
+    top_photos = candidates[:top_n]
+
+    logger.info(f"[终审] 平台: {platform_config['name']}, 候选: {len(candidates)}, 入选: {len(top_photos)}")
+    logger.info(
+        f"[终审] 权重: 构图{weights.get('composition', 0.35)} "
+        f"色彩{weights.get('color', 0.30)} "
+        f"光影{weights.get('lighting', 0.20)} "
+        f"人脸{weights.get('face', 0.15)}"
+    )
 
     # ── Layer 5: 深度分析 ──
     if checkpoint and checkpoint["completed_layer"] >= 5:
@@ -355,11 +393,7 @@ def run_pipeline(
             filename=r.filename,
             aesthetic_score=r.aesthetic_score,
             overall_score=r.overall_score,
-            final_score=(
-                l1_scores.get(r.path, 0.5) * 0.2 +
-                (r.overall_score / 10.0) * 0.6 +
-                face_scores.get(r.path, 0) * 0.2
-            ) * 10,  # 放大到 0-10 范围便于展示
+            final_score=score_map[r.path] * 10,  # 含多样性惩罚，放大到 0-10 范围便于展示
             deep_analysis=deep,
         ))
 

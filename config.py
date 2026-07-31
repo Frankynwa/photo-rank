@@ -12,9 +12,39 @@ CATEGORIES = ["风景", "人像", "人文", "美食", "夜景", "自拍", "合�
 
 # 平台配置
 PLATFORMS = {
-    "xiaohongshu": {"name": "小红书", "style": "氛围感、故事感、封面感", "output_count": 12},
-    "wechat": {"name": "朋友圈", "style": "九宫格叙事", "output_count": 12},
-    "douyin": {"name": "抖音", "style": "冲击力、竖版适配", "output_count": 12},
+    "xiaohongshu": {
+        "name": "小红书",
+        "style": "氛围感、故事感、封面感",
+        "output_count": 12,
+        "weights": {
+            "composition": 0.35,  # 构图
+            "color": 0.30,        # 色彩
+            "lighting": 0.20,     # 光影
+            "face": 0.15,         # 人脸
+        },
+    },
+    "wechat": {
+        "name": "朋友圈",
+        "style": "九宫格叙事",
+        "output_count": 12,
+        "weights": {
+            "composition": 0.25,
+            "color": 0.25,
+            "lighting": 0.30,
+            "face": 0.20,
+        },
+    },
+    "douyin": {
+        "name": "抖音",
+        "style": "冲击力、竖版适配",
+        "output_count": 12,
+        "weights": {
+            "composition": 0.30,
+            "color": 0.25,
+            "lighting": 0.25,
+            "face": 0.20,
+        },
+    },
 }
 
 # Layer 1: 客观指标阈值
@@ -29,6 +59,12 @@ HAMMING_THRESHOLD = 10       # 感知哈希汉明距离（layer2_similarity.py �
 # Layer 3/5 共用
 TOP_K_PER_CATEGORY = 5
 FINAL_OUTPUT_COUNT = 12
+
+# 多样性惩罚（Top N 选择前，对相似照片扣分）
+# 15% 扣分幅度：足以让相似照片从 Top 12 边缘掉出（通常分差 > 10%），
+# 又不至于让一张好照片因轻微相似就被完全挤出榜单。
+DIVERSITY_PENALTY = 0.15
+DIVERSITY_DISTANCE_THRESHOLD = 10  # pHash 汉明距离低于此值视为相似
 
 # Qwen API
 QWEN_BASE_URL = os.environ.get(

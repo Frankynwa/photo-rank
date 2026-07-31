@@ -40,6 +40,9 @@ class Layer3Result(BaseModel):
     technical_score: float = 0.0
     overall_score: float = 0.0
     final_score: float = 0.0
+    composition_score: float = 0
+    color_score: float = 0
+    lighting_score: float = 0
     error: Optional[str] = None
     device: str = "cpu"
 

@@ -20,6 +20,31 @@ from core.models import EmotionAnalysis, Layer5Result
 
 logger = logging.getLogger(__name__)
 
+# 平台专属分析 prompt
+PLATFORM_PROMPTS = {
+    "xiaohongshu": {
+        "classification": "分析这张照片的类型（风景/人像/美食/街拍/夜景/其他）。小红书用户偏好：氛围感、故事感、封面感强的照片。",
+        "composition": "从构图角度分析这张照片（三分法/对称/引导线/框架/留白等）。小红书封面需要强构图感。给出构图评分（1-10）和具体建议。以 JSON 返回：{\"score\": 数字, \"analysis\": \"分析\", \"suggestion\": \"建议\"}",
+        "improvement": "从小红书爆款角度，给出这张照片的改进建议（调色/裁剪/滤镜/文字排版）。",
+        "emotion": "分析照片的情绪氛围和适合的小红书文案风格。以 JSON 返回：{\"primary_emotion\": \"主要情绪\", \"mood_keywords\": [\"关键词1\",\"关键词2\"], \"suitable_copywriting_style\": \"文案风格\"}",
+        "copywriting": "为这张照片写一段小红书风格的文案（100字内）。要求：有氛围感、带 emoji、有故事感、适合做封面配文。",
+    },
+    "wechat": {
+        "classification": "分析这张照片的类型。朋友圈照片需要：生活感、真实感、叙事性。",
+        "composition": "从构图角度分析。朋友圈九宫格需要照片之间有节奏感。给出构图评分（1-10）和分析。以 JSON 返回：{\"score\": 数字, \"analysis\": \"分析\", \"suggestion\": \"建议\"}",
+        "improvement": "从朋友圈分享角度，给出改进建议。",
+        "emotion": "分析照片的情绪，适合朋友圈什么场景分享（日常/旅行/美食/感悟）。以 JSON 返回：{\"primary_emotion\": \"主要情绪\", \"mood_keywords\": [\"关键词1\",\"关键词2\"], \"suitable_copywriting_style\": \"文案风格\"}",
+        "copywriting": "为这张照片写一段朋友圈文案（50字内）。要求：自然、有生活感、不做作、适合配九宫格。",
+    },
+    "douyin": {
+        "classification": "分析这张照片的类型。抖音封面需要：视觉冲击力、竖版适配、好奇心驱动。",
+        "composition": "从构图角度分析。抖音封面需要强视觉冲击。给出构图评分（1-10）和分析。以 JSON 返回：{\"score\": 数字, \"analysis\": \"分析\", \"suggestion\": \"建议\"}",
+        "improvement": "从抖音爆款角度，给出改进建议（冲击力/色彩/竖版裁剪）。",
+        "emotion": "分析照片的情绪张力，是否适合做抖音封面。以 JSON 返回：{\"primary_emotion\": \"主要情绪\", \"mood_keywords\": [\"关键词1\",\"关键词2\"], \"suitable_copywriting_style\": \"文案风格\"}",
+        "copywriting": "为这张照片写一段抖音风格的文案/标题（30字内）。要求：有冲击力、引发好奇、适合做视频封面文字。",
+    },
+}
+
 # API Key 缓存
 _api_key_cache: str | None = None
 _api_key_lock = threading.Lock()
@@ -132,25 +157,27 @@ async def _call_api(prompt: str, image_path: str | Path, max_retries: int = 3) -
                 raise
 
 
-async def classify_photo(image_path: str | Path) -> str:
-    prompt = """这张照片属于哪个类别？只回答编号和名称。
-1. 风景  2. 人像  3. 人文  4. 美食  5. 夜景  6. 自拍  7. 合照  8. 其他
-格式：编号. 名称"""
+async def classify_photo(image_path: str | Path, platform: str = "xiaohongshu") -> str:
+    prompts = PLATFORM_PROMPTS.get(platform, PLATFORM_PROMPTS["xiaohongshu"])
+    prompt = prompts["classification"]
     return (await _call_api(prompt, image_path)).strip()
 
 
-async def analyze_composition(image_path: str | Path) -> str:
-    prompt = """分析这张照片的构图：1.主要构图方法 2.主体位置和留白 3.构图优点 4.改进建议。每点一句话。"""
+async def analyze_composition(image_path: str | Path, platform: str = "xiaohongshu") -> str:
+    prompts = PLATFORM_PROMPTS.get(platform, PLATFORM_PROMPTS["xiaohongshu"])
+    prompt = prompts["composition"]
     return (await _call_api(prompt, image_path)).strip()
 
 
-async def suggest_improvement(image_path: str | Path) -> str:
-    prompt = """给这张照片改进建议：1.裁剪（裁哪边，比例）2.调色（亮度/对比度/饱和度/色温）3.角度。每点具体参数。"""
+async def suggest_improvement(image_path: str | Path, platform: str = "xiaohongshu") -> str:
+    prompts = PLATFORM_PROMPTS.get(platform, PLATFORM_PROMPTS["xiaohongshu"])
+    prompt = prompts["improvement"]
     return (await _call_api(prompt, image_path)).strip()
 
 
-async def analyze_emotion(image_path: str | Path) -> EmotionAnalysis:
-    prompt = """分析照片情绪（JSON）：{"primary_emotion":"快乐/宁静/震撼/孤独/温暖/自由/期待/感动","emotion_intensity":8,"mood_keywords":["k1","k2","k3"],"suitable_copywriting_style":"文艺/哲思/温暖/幽默/简洁"}"""
+async def analyze_emotion(image_path: str | Path, platform: str = "xiaohongshu") -> EmotionAnalysis:
+    prompts = PLATFORM_PROMPTS.get(platform, PLATFORM_PROMPTS["xiaohongshu"])
+    prompt = prompts["emotion"]
     result = await _call_api(prompt, image_path)
     parsed = _extract_json(result)
     if not parsed:
@@ -165,19 +192,18 @@ async def analyze_emotion(image_path: str | Path) -> EmotionAnalysis:
 
 
 async def generate_copywriting(image_path: str | Path, platform: str = "xiaohongshu") -> str:
-    names = {"xiaohongshu": "小红书", "wechat": "朋友圈", "douyin": "抖音"}
-    name = names.get(platform, "社交平台")
-    prompt = f"""为这张照片写{name}文案。有深度有哲思，低调谦卑不装。15-30字。禁用"绝了/太美了/氛围感拉满"、emoji、#标签。只输出文案。"""
+    prompts = PLATFORM_PROMPTS.get(platform, PLATFORM_PROMPTS["xiaohongshu"])
+    prompt = prompts["copywriting"]
     return (await _call_api(prompt, image_path)).strip()
 
 
 async def deep_analyze(image_path: str | Path, platform: str = "xiaohongshu") -> Layer5Result:
     """单张深度分析（5 个并行 API 调用）"""
     results = await asyncio.gather(
-        classify_photo(image_path),
-        analyze_composition(image_path),
-        suggest_improvement(image_path),
-        analyze_emotion(image_path),
+        classify_photo(image_path, platform),
+        analyze_composition(image_path, platform),
+        suggest_improvement(image_path, platform),
+        analyze_emotion(image_path, platform),
         generate_copywriting(image_path, platform),
         return_exceptions=True,
     )

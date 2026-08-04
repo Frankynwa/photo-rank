@@ -191,7 +191,7 @@ def run_pipeline(
     # ── Layer 2: 相似聚类 ──
     if checkpoint and checkpoint["completed_layer"] >= 2:
         clusters = [SimilarityCluster(**c) for c in checkpoint["clusters"]]
-        representatives = [c.representative for c in clusters]
+        representatives = [r for c in clusters for r in (c.representatives or [c.representative])]
         merged = sum(c.member_count - 1 for c in clusters if c.member_count > 1)
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
         logger.info(f"[L2] 从 checkpoint 恢复: {len(clusters)} 组")
@@ -200,7 +200,7 @@ def run_pipeline(
         try:
             sharpness_scores = {r.path: r.sharpness for r in kept}
             clusters = cluster_photos([r.path for r in kept], sharpness_scores)
-            representatives = [c.representative for c in clusters]
+            representatives = [r for c in clusters for r in (c.representatives or [c.representative])]
             merged = sum(c.member_count - 1 for c in clusters if c.member_count > 1)
             logger.info(f"[L2] 聚类: {len(clusters)} 组, 合并: {merged}")
         except Exception as e:

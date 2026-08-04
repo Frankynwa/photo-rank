@@ -196,13 +196,18 @@ def cluster_photos(
             groups[root] = []
         groups[root].append(p)
 
-    # 构建结果
+    # 构建结果：每组按清晰度取前 2 张作为代表
+    # 同场景连拍的第 2 张也有机会进入审美层（L3）参与竞争，
+    # 最终由融合分 + 多样性惩罚决定去留，避免"只留清晰但构图差"的一张。
     clusters: list[SimilarityClusterModel] = []
     for root, members in groups.items():
-        best = max(members, key=lambda p: sharpness_scores.get(p, 0))
+        ranked = sorted(members, key=lambda p: sharpness_scores.get(p, 0), reverse=True)
+        best = ranked[0]
+        representatives = ranked[:2]
         clusters.append(SimilarityClusterModel(
             cluster_id=len(clusters),
             representative=best,
+            representatives=representatives,
             filename=Path(best).name,
             members=members,
             member_count=len(members),
@@ -214,6 +219,7 @@ def cluster_photos(
         clusters.append(SimilarityClusterModel(
             cluster_id=len(clusters),
             representative=p,
+            representatives=[p],
             filename=Path(p).name,
             members=[p],
             member_count=1,

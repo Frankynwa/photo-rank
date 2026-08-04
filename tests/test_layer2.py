@@ -133,6 +133,28 @@ class TestClusterPhotos:
         assert len(clusters) == 1
         assert clusters[0].representative == paths[1]
 
+    def test_representatives_top2_by_sharpness(self, tmp_path: Path):
+        """每组应按清晰度取前 2 张作为代表，最高清晰度排首位"""
+        paths = []
+        for i in range(4):
+            p = _make_gradient_image(tmp_path / f"top2_{i}.png")
+            paths.append(str(p))
+
+        # 清晰度：p1 > p3 > p2 > p0
+        sharpness = {paths[0]: 10.0, paths[1]: 999.0, paths[2]: 20.0, paths[3]: 500.0}
+        clusters = cluster_photos(paths, sharpness, threshold=10)
+
+        assert len(clusters) == 1
+        assert clusters[0].representatives == [paths[1], paths[3]]
+        assert clusters[0].representative == paths[1]
+
+    def test_single_member_representatives(self, tmp_path: Path):
+        """单成员簇的 representatives 应只含自身"""
+        p = _make_gradient_image(tmp_path / "solo.png")
+        clusters = cluster_photos([str(p)], {str(p): 50.0}, threshold=10)
+        assert len(clusters) == 1
+        assert clusters[0].representatives == [str(p)]
+
     def test_empty_input(self):
         """空输入应返回空列表"""
         clusters = cluster_photos([], {}, threshold=10)

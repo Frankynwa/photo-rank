@@ -27,7 +27,8 @@ class SimilarityCluster(BaseModel):
     cluster_id: int = 0
     member_count: int = 1
     members: list[str] = []
-    representative: str = ""
+    representative: str = ""  # 清晰度最高的一张（兼容旧字段）
+    representatives: list[str] = []  # 按清晰度取前 2 张进入审美层
     filename: str = ""
     member_scores: dict[str, float] = {}
 

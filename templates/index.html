@@ -792,10 +792,7 @@
                 card.className = 'photo-card';
                 card.style.position = 'relative';
 
-                const deep = result.deep_analysis || {};
-                const emotion = deep.emotion || {};
-                const classification = deep.classification || '';
-                const copywriting = deep.copywriting || '';
+                const classification = result.category || '';
 
                 card.innerHTML = `
                     <div class="rank">${index + 1}</div>
@@ -811,7 +808,6 @@
                             <span class="value">${result.final_score}</span>
                         </div>
                         ${classification ? `<div class="analysis"><span class="tag">${classification}</span></div>` : ''}
-                        ${copywriting ? `<div class="analysis">"${copywriting}"</div>` : ''}
                     </div>
                 `;
 
@@ -836,28 +832,12 @@
 
             modalImage.src = `/api/results/${currentPlatform}/${result.filename}`;
 
-            const deep = result.deep_analysis || {};
-            const emotion = deep.emotion || {};
-
             modalAnalysis.innerHTML = `
                 <h3>📊 评分</h3>
                 <p>审美分: ${result.aesthetic_score} | 综合分: ${result.final_score}</p>
 
                 <h3>🏷️ 分类</h3>
-                <p>${deep.classification || '未分析'}</p>
-
-                <h3>🎨 构图分析</h3>
-                <p>${deep.composition || '未分析'}</p>
-
-                <h3>💡 改进建议</h3>
-                <p>${deep.improvement || '未分析'}</p>
-
-                <h3>😊 情绪分析</h3>
-                <p>主要情绪: ${emotion.primary_emotion || '未知'} (${emotion.emotion_intensity || 5}/10)</p>
-                <p>关键词: ${(emotion.mood_keywords || []).join(', ')}</p>
-
-                <h3>✍️ 文案</h3>
-                <p>"${deep.copywriting || '未生成'}"</p>
+                <p>${result.category || '未分类'}</p>
             `;
 
             modal.classList.add('show');

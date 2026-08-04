@@ -43,10 +43,22 @@ class TestAnalyzeMetrics:
         img = self._make_bgr(color=(128, 128, 128))  # 中灰
         _, exposure, over_ratio, under_ratio, _ = _analyze_metrics(img)
         assert 0.0 <= exposure <= 1.0
-        # 中灰 → mean_brightness=128 → exposure_score = 1.0 - |128-128|/128 = 1.0
+        # 中灰 → mean_brightness=128 → 落在合理区间 → exposure_score = 1.0
         assert exposure == pytest.approx(1.0, abs=0.02)
         assert over_ratio == 0.0
         assert under_ratio == 0.0
+
+    def test_exposure_band_mid_brightness_full_score(self):
+        """亮度 100（合理区间内）应满分，不再按远离 128 扣分"""
+        img = self._make_bgr(color=(100, 100, 100))
+        _, exposure, _, _, _ = _analyze_metrics(img)
+        assert exposure == pytest.approx(1.0, abs=0.02)
+
+    def test_exposure_dark_night_penalty_softened(self):
+        """夜景均值 30 不再被重罚（旧公式 0.23，新区间法明显更高）"""
+        img = self._make_bgr(color=(30, 30, 30))
+        _, exposure, _, _, _ = _analyze_metrics(img)
+        assert exposure > 0.6, f"夜景曝光分应 > 0.6，实际 {exposure}"
 
     def test_overexposed_image(self):
         """接近全白的图片 over_ratio 应很高"""
@@ -148,6 +160,18 @@ class TestAnalyzeImage:
         score = analyze_image(path)
         assert score.is_blurry
         assert "模糊" in score.reject_reason
+
+    def test_dark_night_scene_not_rejected(self, tmp_path: Path):
+        """夜景照片（暗部占比高但仍有亮部细节）不应被误判为欠曝淘汰"""
+        rng = np.random.default_rng(7)
+        img = np.full((100, 100, 3), 10, dtype=np.uint8)  # 65% 暗部（街景阴影）
+        img[:35, :100] = rng.integers(150, 220, (35, 100, 3), dtype=np.uint8)  # 35% 灯火
+        path = tmp_path / "night.png"
+        cv2.imwrite(str(path), img)
+
+        score = analyze_image(path)
+        assert not score.is_underexposed, "暗部 65% 的夜景不应被误淘汰"
+        assert not score.is_blurry
 
 
 class TestBatchAnalyze:

@@ -43,6 +43,9 @@ class Layer3Result(BaseModel):
     composition_score: float = 0
     color_score: float = 0
     lighting_score: float = 0
+    vlm_overall_score: float = 0.0  # VLM 综合审美分（>0 表示真实评分，否则为未评分）
+    score_reason: str = ""  # VLM 评分理由
+    category: str = ""  # VLM 分类标签（风景/建筑/人像/人文纪实/美食/动物/夜景/其他）
     error: Optional[str] = None
     device: str = "cpu"
 
@@ -59,34 +62,14 @@ class Layer4Result(BaseModel):
     overall_face_score: float = 0.0
 
 
-class EmotionAnalysis(BaseModel):
-    """情绪分析"""
-    primary_emotion: str = "未知"
-    emotion_intensity: float = 5.0
-    mood_keywords: list[str] = []
-    suitable_copywriting_style: str = "文艺"
-
-
-class Layer5Result(BaseModel):
-    """Layer 5 深度分析输出"""
-    path: str
-    filename: str
-    classification: str = "未分析"
-    composition: str = "未分析"
-    improvement: str = "未分析"
-    emotion: EmotionAnalysis = EmotionAnalysis()
-    copywriting: str = "未生成"
-    platform: str = "xiaohongshu"
-
-
 class FinalResult(BaseModel):
-    """最终输出：评分 + 深度分析"""
+    """最终输出：评分 + 分类标签"""
     path: str
     filename: str
     aesthetic_score: float
     overall_score: float
     final_score: float
-    deep_analysis: Layer5Result
+    category: str = ""
 
 
 class PipelineResult(BaseModel):

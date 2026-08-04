@@ -8,7 +8,14 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from config import LAPLACIAN_THRESHOLD, OVEREXPOSURE_THRESHOLD, UNDEREXPOSURE_THRESHOLD
+from config import (
+    EXPOSURE_BAND,
+    LAPLACIAN_THRESHOLD,
+    OVEREXPOSURE_RATIO_THRESHOLD,
+    OVEREXPOSURE_THRESHOLD,
+    UNDEREXPOSURE_RATIO_THRESHOLD,
+    UNDEREXPOSURE_THRESHOLD,
+)
 from core.models import Layer1Result
 
 logger = logging.getLogger(__name__)
@@ -68,11 +75,16 @@ def _analyze_metrics(image: np.ndarray) -> tuple:
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     sharpness = lap.var()
 
-    # 曝光
+    # 曝光：亮度落在合理区间内不扣分（避免夜景/雪景等合法场景被误判）
     mean_brightness = np.mean(gray)
     over_ratio = np.sum(gray > OVEREXPOSURE_THRESHOLD) / gray.size
     under_ratio = np.sum(gray < UNDEREXPOSURE_THRESHOLD) / gray.size
-    exposure_score = 1.0 - abs(mean_brightness - 128) / 128
+    band_lo, band_hi = EXPOSURE_BAND
+    if band_lo <= mean_brightness <= band_hi:
+        exposure_score = 1.0
+    else:
+        dist = max(band_lo - mean_brightness, mean_brightness - band_hi, 0.0)
+        exposure_score = max(0.0, 1.0 - dist / 128.0)
 
     # 噪声
     noise_std = np.std(lap)
@@ -95,8 +107,8 @@ def analyze_image(image_path: str | Path) -> ObjectiveScore:
     overall = sharpness_norm * 0.4 + exposure * 0.3 + noise * 0.3
 
     is_blurry = sharpness < LAPLACIAN_THRESHOLD
-    is_over = over_ratio > 0.3
-    is_under = under_ratio > 0.5
+    is_over = over_ratio > OVEREXPOSURE_RATIO_THRESHOLD
+    is_under = under_ratio > UNDEREXPOSURE_RATIO_THRESHOLD
 
     rejected = is_blurry or is_over or is_under
     reasons = []

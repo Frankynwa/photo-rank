@@ -224,6 +224,48 @@ class TestInvalidPaths:
 
 
 # ---------------------------------------------------------------------------
+# TOPIQ 批次归一化测试
+# ---------------------------------------------------------------------------
+
+class TestNormalizeBatchScores:
+    def test_batch_normalization_spreads_scores(self):
+        """多张不同分数照片应被 p5-p95 拉伸拉开区分度，且保持单调"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=s)
+            for i, s in enumerate([5.0, 6.0, 7.0, 8.0, 9.0], 1)
+        ]
+        _normalize_batch_scores(results)
+        scores = [r.overall_score for r in results]
+        assert scores[0] == 0.0
+        assert scores[-1] == 10.0
+        assert scores == sorted(scores)  # 保持单调
+
+    def test_single_image_no_change(self):
+        """单张图片不应被归一化"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        r = Layer3Result(path="/x/1", filename="1.jpg", overall_score=6.5)
+        _normalize_batch_scores([r])
+        assert r.overall_score == 6.5
+
+    def test_concentrated_scores_no_change(self):
+        """分数分布过于集中时保持不变，避免噪声放大"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=6.0)
+            for i in range(3)
+        ]
+        _normalize_batch_scores(results)
+        assert all(r.overall_score == 6.0 for r in results)
+
+
+# ---------------------------------------------------------------------------
 # 模型加载容错测试
 # ---------------------------------------------------------------------------
 
@@ -263,3 +305,43 @@ class TestModelLoading:
         assert len(results) == 1
         assert results[0].error is not None
         assert results[0].device == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# VLM 分类标签解析测试
+# ---------------------------------------------------------------------------
+
+class TestParseDimensionJson:
+    def test_category_extracted(self):
+        """合法的 category 应被提取"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "主体突出", "composition_score": 8.0, "color_score": 7.5, '
+                '"lighting_score": 7.0, "overall_aesthetic_score": 8.0, "category": "风景"}')
+        out = _parse_dimension_json(text)
+        assert out["category"] == "风景"
+        assert out["composition_score"] == 8.0
+
+    def test_category_missing_returns_scores_only(self):
+        """缺 category 时分数正常返回，但不含 category 键"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "主体突出", "composition_score": 8.0, "color_score": 7.5, '
+                '"lighting_score": 7.0, "overall_aesthetic_score": 8.0}')
+        out = _parse_dimension_json(text)
+        assert "composition_score" in out
+        assert "category" not in out
+
+    def test_category_invalid_ignored(self):
+        """不在枚举中的 category 应被忽略"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "主体突出", "composition_score": 8.0, "color_score": 7.5, '
+                '"lighting_score": 7.0, "overall_aesthetic_score": 8.0, "category": "抽象艺术"}')
+        out = _parse_dimension_json(text)
+        assert "category" not in out
+
+    def test_category_non_string_ignored(self):
+        """category 为数字时应被忽略"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "主体突出", "composition_score": 8.0, "color_score": 7.5, '
+                '"lighting_score": 7.0, "overall_aesthetic_score": 8.0, "category": 123}')
+        out = _parse_dimension_json(text)
+        assert "category" not in out

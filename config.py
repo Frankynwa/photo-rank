@@ -67,11 +67,11 @@ EXPOSURE_BAND = (70, 180)
 
 # Layer 2: 相似聚类（汉明距离，对应 config 的语义阈值）
 SIMILARITY_THRESHOLD = 0.85  # 余弦相似度（备用，当前未被任何模块引用）
-HAMMING_THRESHOLD = 10       # 感知哈希汉明距离（layer2_similarity.py 使用）
+HAMMING_THRESHOLD = 20       # 感知哈希汉明距离（layer2_similarity.py 使用）
 
 # Layer 3/5 共用
 TOP_K_PER_CATEGORY = 5
-FINAL_OUTPUT_COUNT = 12
+FINAL_OUTPUT_COUNT = 100
 
 # 多样性惩罚（Top N 选择前，对相似照片扣分）
 # 15% 扣分幅度：足以让相似照片从 Top 12 边缘掉出（通常分差 > 10%），
@@ -80,7 +80,7 @@ DIVERSITY_PENALTY = 0.15
 DIVERSITY_DISTANCE_THRESHOLD = 10  # pHash 汉明距离低于此值视为相似
 
 # 视频抽帧：流式逐帧筛选，不合格帧不落盘
-VIDEO_FRAME_INTERVAL = 2.0  # 候选帧采样间隔（秒）
+VIDEO_FRAME_INTERVAL = 1.0  # 候选帧采样间隔（秒）
 VIDEO_MAX_FRAMES = 200  # 单视频候选帧上限（超出自动放大间隔）
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 # 视频帧模糊判定（照片阈值不适用：HEVC 压缩 + 4K 稀释使 Laplacian 天然偏低）

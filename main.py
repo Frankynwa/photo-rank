@@ -1,10 +1,19 @@
 """PhotoRank Web UI — FastAPI + 原生 HTML/JS"""
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, HTMLResponse
 
 # ─────────────────────────────────────────────────────────
@@ -15,6 +24,8 @@ from config import (
     OUTPUT_DIR,
     PORT,
     PROJECT_ROOT,
+    VIDEO_EXTS,
+    VIDEOS_DIR,
 )
 from config import (
     PHOTOS_DIR as UPLOADS_DIR,  # config.py 中命名为 PHOTOS_DIR
@@ -36,19 +47,26 @@ TEMPLATES_DIR = PROJECT_ROOT / "templates"
 # P0 安全常量 — 不可删除
 # ─────────────────────────────────────────────────────────
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_VIDEO_UPLOAD_SIZE = 200 * 1024 * 1024  # 视频上限 200MB
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
 ALLOWED_MIME_TYPES = {
     "image/jpeg", "image/png", "image/gif", "image/bmp",
     "image/webp", "image/heic", "image/heif",
 }
+VIDEO_MIME_TYPES = {
+    "video/mp4", "video/quicktime", "video/x-msvideo",
+    "video/x-matroska", "video/webm",
+}
 
 
 def secure_filename(filename: str) -> str:
-    """防路径遍历：去除目录片段，返回安全文件名"""
+    """防路径遍历 + 净化 Windows 非法字符，返回安全文件名"""
     name = filename.replace("\\", "/").rsplit("/", 1)[-1]
     parts = [p for p in name.split("/") if p and p != ".."]
     safe = "_".join(parts) if parts else "unnamed"
-    return safe
+    # Windows 保留字符：避免保存时 OSError（项目运行在 Windows）
+    safe = re.sub(r'[\\/:*?"<>|]', "_", safe).strip()
+    return safe or "unnamed"
 
 
 UPLOADS_DIR.mkdir(exist_ok=True)
@@ -134,6 +152,81 @@ async def upload_photos(files: list[UploadFile] = File(...)):
     })
 
     return {"uploaded": uploaded, "total": len(uploaded)}
+
+
+@app.post("/api/upload_video")
+async def upload_video(request: Request, file: UploadFile = File(...)):
+    """上传视频并流式抽帧：本地快筛（L1/L2/L4）后，合格帧写入 uploads 顶层"""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="缺少文件名")
+
+    safe_name = secure_filename(file.filename)
+    ext = Path(safe_name).suffix.lower()
+
+    if ext not in VIDEO_EXTS:
+        raise HTTPException(status_code=400, detail=f"不支持的视频类型: {ext}")
+
+    # MIME 类型白名单（与照片接口行为一致）
+    if file.content_type and file.content_type not in VIDEO_MIME_TYPES:
+        raise HTTPException(status_code=400, detail=f"不支持的 MIME 类型: {file.content_type}")
+
+    # Content-Length 预检：超限直接拒绝，不读取请求体（防内存 DoS）
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() \
+            and int(content_length) > MAX_VIDEO_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"视频过大，最大允许 {MAX_VIDEO_UPLOAD_SIZE // (1024 * 1024)} MB",
+        )
+
+    # 保存视频（分块写盘，累计超限即中断并清理半成品）
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    video_path = VIDEOS_DIR / safe_name
+    try:
+        written = 0
+        with open(video_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > MAX_VIDEO_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"视频过大，最大允许 {MAX_VIDEO_UPLOAD_SIZE // (1024 * 1024)} MB",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        video_path.unlink(missing_ok=True)
+        raise
+    except OSError as e:
+        video_path.unlink(missing_ok=True)
+        logger.error(f"[视频保存] 写入失败 {safe_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"视频保存失败: {e}")
+
+    # 流式抽帧 + 本地快筛（耗 CPU，放线程池避免阻塞事件循环）
+    from core.video_frames import VideoExtractError, extract_quality_frames
+
+    try:
+        stats = await asyncio.to_thread(
+            extract_quality_frames, video_path, UPLOADS_DIR,
+        )
+    except VideoExtractError as e:
+        video_path.unlink(missing_ok=True)  # 失败不残留垃圾视频文件
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        video_path.unlink(missing_ok=True)
+        logger.error(f"[视频抽帧] 失败 {safe_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"视频抽帧失败: {e}")
+
+    await manager.broadcast({
+        "type": "video_frames_ready",
+        "video": safe_name,
+        "stats": {k: v for k, v in stats.items() if k != "saved"},
+    })
+
+    return {
+        "video": safe_name,
+        "stats": stats,
+        "message": f"抽帧完成：候选 {stats['candidates']} → 保留 {stats['kept']} 帧",
+    }
 
 
 @app.get("/api/photos")

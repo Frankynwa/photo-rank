@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 # 全局缓存：避免每次调用都创建新实例
 _global_analyzer = None
 _global_analyzer_lock = threading.Lock()
+# 全局调用锁：MediaPipe FaceLandmarker 官方非线程安全，
+# 视频抽帧的 L4 与流水线 L4 可能经 asyncio.to_thread 并发调用，串行化防 C++ 层崩溃
+_analyze_call_lock = threading.Lock()
 
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
 EXPECTED_SIZE = 3 * 1024 * 1024  # ~3MB
@@ -183,9 +186,10 @@ class FaceAnalyzer:
 
 
 def analyze_faces(image_paths: list[str | Path]) -> list[Layer4Result]:
-    """批量人脸分析（复用全局实例）"""
+    """批量人脸分析（复用全局实例，串行化调用保证线程安全）"""
     global _global_analyzer
     with _global_analyzer_lock:
         if _global_analyzer is None:
             _global_analyzer = FaceAnalyzer()
-    return _global_analyzer.batch_analyze(image_paths)
+    with _analyze_call_lock:
+        return _global_analyzer.batch_analyze(image_paths)

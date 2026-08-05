@@ -713,6 +713,7 @@
                     body: formData,
                 });
                 const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || '上传失败');
 
                 showStatus(`上传完成！共 ${data.total} 张照片`, 'success');
                 loadPhotos();

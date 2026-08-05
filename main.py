@@ -123,7 +123,14 @@ async def upload_photos(files: list[UploadFile] = File(...)):
             raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}")
 
         # MIME 类型白名单
-        if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
+        # 注意：浏览器上传 HEIC/HEIF 时 Content-Type 通常为 application/octet-stream
+        #（浏览器不识别该格式的通病），扩展名已过白名单，故放行 octet-stream，
+        # 文件真实性由下游 PIL 解码验证。
+        if (
+            file.content_type
+            and file.content_type not in ALLOWED_MIME_TYPES
+            and file.content_type != "application/octet-stream"
+        ):
             raise HTTPException(status_code=400, detail=f"不支持的 MIME 类型: {file.content_type}")
 
         content = await file.read()

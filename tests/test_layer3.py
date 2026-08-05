@@ -134,8 +134,8 @@ class TestScorePhotos:
 # ---------------------------------------------------------------------------
 
 class TestScoreRange:
-    def test_score_mapped_to_0_10(self, tmp_path):
-        """模型输出 [0,1] 应映射到 [0,10]"""
+    def test_score_passed_through_0_10(self, tmp_path):
+        """模型输出即 0-10 的 MOS 分（dist_to_mos 已映射），不再 ×10"""
         mock_pyiqa, mock_torch = _build_mock_modules(score_value=0.75)
         with patch.dict(sys.modules, {"pyiqa": mock_pyiqa, "torch": mock_torch}):
             from core.layer3_aesthetic import score_photos
@@ -143,7 +143,7 @@ class TestScoreRange:
             results = score_photos([p], device="cpu")
 
         r = results[0]
-        expected = round(0.75 * 10, 4)  # 7.5
+        expected = round(0.75, 4)
         assert r.aesthetic_score == expected
         assert r.technical_score == expected
         assert r.overall_score == expected
@@ -159,17 +159,17 @@ class TestScoreRange:
         assert results[0].aesthetic_score == 0.0
 
     def test_score_boundary_ten(self, tmp_path):
-        """模型输出 1.0 应映射到 10.0"""
+        """模型输出 1.0 即 1.0 分（不缩放）"""
         mock_pyiqa, mock_torch = _build_mock_modules(score_value=1.0)
         with patch.dict(sys.modules, {"pyiqa": mock_pyiqa, "torch": mock_torch}):
             from core.layer3_aesthetic import score_photos
             p = _make_random_image(tmp_path / "ten.png")
             results = score_photos([p], device="cpu")
-        assert results[0].aesthetic_score == 10.0
+        assert results[0].aesthetic_score == 1.0
 
     def test_score_clamped_above_ten(self, tmp_path):
-        """TOPIQ raw 分超范围时应钳制到 10.0（防分数体系崩坏）"""
-        mock_pyiqa, mock_torch = _build_mock_modules(score_value=4.85)  # raw 48.5
+        """TOPIQ raw 分超 10 时应钳制到 10.0（防分数体系崩坏）"""
+        mock_pyiqa, mock_torch = _build_mock_modules(score_value=12.0)  # raw 12.0
         with patch.dict(sys.modules, {"pyiqa": mock_pyiqa, "torch": mock_torch}):
             from core.layer3_aesthetic import score_photos
             p = _make_random_image(tmp_path / "over.png")

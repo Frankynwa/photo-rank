@@ -194,8 +194,9 @@ def score_topiq(
             try:
                 from core.image_cache import get_cached_path
                 img = Image.open(get_cached_path(path)).convert("RGB")
-                # TOPIQ-IAA 输出映射 [0,10]，raw 偶发超范围 → 钳制防分数体系崩坏
-                score = max(0.0, min(10.0, model(img).item() * 10))
+                # pyiqa topiq_iaa 经 dist_to_mos 输出已是 1-10 的 MOS 分（score_range='1,10'），
+                # 直接使用即可；偶发超范围 → 钳制防分数体系崩坏
+                score = max(0.0, min(10.0, model(img).item()))
                 results.append(Layer3Result(
                     path=str(path), filename=Path(path).name,
                     aesthetic_score=round(score, 4),

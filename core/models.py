@@ -46,13 +46,20 @@ class Layer3Result(BaseModel):
     lighting_score: float = 0
     vlm_overall_score: float = 0.0  # VLM 综合审美分（>0 表示真实评分，否则为未评分）
     score_reason: str = ""  # VLM 评分理由
+    hard_flaws: list[str] = []  # VLM 自报硬伤列表（闭眼/模糊/过曝等，用于钳制与诊断）
     category: str = ""  # VLM 分类标签（风景/建筑/人像/人文纪实/美食/动物/夜景/其他）
     error: Optional[str] = None
     device: str = "cpu"
 
 
 class Layer4Result(BaseModel):
-    """Layer 4 人脸质量输出"""
+    """Layer 4 人脸质量输出
+
+    face_ratio:        主脸 bbox 面积 / 画面面积（0-1，反映人物在画面中的占比）
+    second_face_ratio: 次大脸面积 / 主脸面积（0-1；≈1 面积均匀=合影，<0.5 主次分明=单主体+背景）
+    main_face_blink:   主脸（面积最大者）是否闭眼
+    blink_detected:    任一检测到的人脸闭眼（合影硬伤用）
+    """
     path: str
     filename: str
     face_count: int = 0
@@ -61,16 +68,35 @@ class Layer4Result(BaseModel):
     expression_score: float = 0.0
     face_clarity: float = 0.0
     overall_face_score: float = 0.0
+    face_ratio: float = 0.0
+    second_face_ratio: float = 0.0
+    main_face_blink: bool = False
 
 
 class FinalResult(BaseModel):
-    """最终输出：评分 + 分类标签"""
+    """最终输出：评分 + 分类标签
+
+    source_video/timestamp: 仅视频帧有值（来源视频名 + 帧在视频内的时间秒数）
+    """
     path: str
     filename: str
     aesthetic_score: float
     overall_score: float
     final_score: float
     category: str = ""
+    source_video: str = ""
+    timestamp: float = 0.0
+
+
+class VideoFrameInfo(BaseModel):
+    """视频帧元数据（manifest.json 条目）：来源视频 + 时间戳 + 快筛指标"""
+    filename: str
+    source_video: str = ""
+    timestamp: float = 0.0
+    sharpness: float = 0.0
+    overall: float = 0.0
+    phash: str = ""
+    duration: float = 0.0
 
 
 class PipelineResult(BaseModel):

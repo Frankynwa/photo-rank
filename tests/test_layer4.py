@@ -144,6 +144,9 @@ class TestFaceQuality:
         assert fq.expression_score == 0.0
         assert fq.face_clarity == 0.0
         assert fq.overall_face_score == 0.0
+        assert fq.face_ratio == 0.0
+        assert fq.second_face_ratio == 0.0
+        assert fq.main_face_blink is False
 
     def test_custom_values(self):
         """自定义值应正确赋值"""
@@ -151,10 +154,14 @@ class TestFaceQuality:
         fq = FaceQuality(
             face_count=2, has_face=True, blink_detected=True,
             expression_score=0.8, face_clarity=0.9, overall_face_score=0.7,
+            face_ratio=0.24, second_face_ratio=1.0, main_face_blink=True,
         )
         assert fq.face_count == 2
         assert fq.has_face is True
         assert fq.overall_face_score == 0.7
+        assert fq.face_ratio == 0.24
+        assert fq.second_face_ratio == 1.0
+        assert fq.main_face_blink is True
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +250,10 @@ class TestAnalyzeFace:
         assert quality.face_count == 1
         assert quality.expression_score == pytest.approx(0.6, abs=0.01)
         assert quality.blink_detected is False
+        # mock landmarks: x 0.3-0.7, y 0.2-0.8 → 面积 80*120=9600, 图片 200*200
+        assert quality.face_ratio == pytest.approx(0.24, abs=0.01)
+        assert quality.second_face_ratio == 0.0  # 仅一张脸
+        assert quality.main_face_blink is False
 
     def test_blink_detected(self, tmp_path):
         """眨眼应被检测到"""
@@ -276,6 +287,8 @@ class TestAnalyzeFace:
 
         assert quality.face_count == 3
         assert quality.has_face is True
+        # 所有 mock 脸面积相同 → 面积均匀（疑似合影特征）
+        assert quality.second_face_ratio == pytest.approx(1.0, abs=0.01)
 
     def test_quality_scores_range(self, tmp_path):
         """质量评分应在 [0, 1] 范围内"""
@@ -370,6 +383,88 @@ class TestBatchAnalyze:
         assert r.filename == "fields.png"
         assert r.has_face is True
         assert r.face_count == 1
+
+
+# ---------------------------------------------------------------------------
+# to_face_prompt_summary 测试（六档分档文案）
+# ---------------------------------------------------------------------------
+
+class TestToFacePromptSummary:
+    def test_no_face(self):
+        """无人脸 → 聚焦场景文案"""
+        from core.layer4_face import to_face_prompt_summary
+        r = Layer4Result(path="/a.jpg", filename="a.jpg")
+        assert to_face_prompt_summary(r) == "【人脸检测信息】未检测到人脸，请聚焦场景本身。"
+
+    def test_single_face(self):
+        """单张人脸 → 主脸信息"""
+        from core.layer4_face import to_face_prompt_summary
+        r = Layer4Result(
+            path="/a.jpg", filename="a.jpg", has_face=True, face_count=1,
+            main_face_blink=False, face_clarity=0.9, face_ratio=0.24,
+        )
+        text = to_face_prompt_summary(r)
+        assert "检测到 1 张人脸" in text
+        assert "主脸闭眼：否" in text
+        assert "主脸清晰度：清晰" in text
+        assert "人脸占比：半身" in text
+
+    def test_group_uniform_9(self):
+        """多人均匀 → 疑似合影 + 存在闭眼者"""
+        from core.layer4_face import to_face_prompt_summary
+        r = Layer4Result(
+            path="/a.jpg", filename="a.jpg", has_face=True, face_count=5,
+            blink_detected=True, face_clarity=0.9, face_ratio=0.24,
+            second_face_ratio=1.0,
+        )
+        text = to_face_prompt_summary(r)
+        assert "面积均匀分布（疑似合影）" in text
+        assert "存在闭眼者：是" in text
+
+    def test_group_uneven_9(self):
+        """多人主次分明 → 疑似单主体+背景人群 + 主脸闭眼"""
+        from core.layer4_face import to_face_prompt_summary
+        r = Layer4Result(
+            path="/a.jpg", filename="a.jpg", has_face=True, face_count=4,
+            main_face_blink=True, face_clarity=0.8, face_ratio=0.18,
+            second_face_ratio=0.3,
+        )
+        text = to_face_prompt_summary(r)
+        assert "主次分明（疑似单主体+背景人群）" in text
+        assert "主脸闭眼：是" in text
+
+    def test_crowd_uniform_10plus(self):
+        """10+ 人脸均匀 → 多人场景疑似合影"""
+        from core.layer4_face import to_face_prompt_summary
+        r = Layer4Result(
+            path="/a.jpg", filename="a.jpg", has_face=True, face_count=12,
+            blink_detected=False, face_clarity=0.7, face_ratio=0.20,
+            second_face_ratio=1.0,
+        )
+        text = to_face_prompt_summary(r)
+        assert "多人场景，面积均匀，疑似合影" in text
+
+    def test_crowd_uneven_10plus(self):
+        """10+ 人脸主次分明 → 疑似单主体+环境人群"""
+        from core.layer4_face import to_face_prompt_summary
+        r = Layer4Result(
+            path="/a.jpg", filename="a.jpg", has_face=True, face_count=12,
+            main_face_blink=False, face_clarity=0.9, face_ratio=0.05,
+            second_face_ratio=0.2,
+        )
+        text = to_face_prompt_summary(r)
+        assert "多人场景，主次分明，疑似单主体+环境人群" in text
+        assert "主脸占比：环境人像" in text
+
+    def test_mid_distribution_goes_group(self):
+        """中间态 0.5-0.7 归入合影档（保守处理）"""
+        from core.layer4_face import to_face_prompt_summary
+        r = Layer4Result(
+            path="/a.jpg", filename="a.jpg", has_face=True, face_count=3,
+            face_clarity=0.9, face_ratio=0.24, second_face_ratio=0.6,
+        )
+        text = to_face_prompt_summary(r)
+        assert "疑似合影" in text
 
 
 # ---------------------------------------------------------------------------

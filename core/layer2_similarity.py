@@ -161,19 +161,32 @@ def cluster_photos(
     image_paths: list[str | Path],
     sharpness_scores: dict[str, float],
     threshold: int = HAMMING_THRESHOLD,
+    precomputed_hashes: dict[str, imagehash.ImageHash] | None = None,
 ) -> list[SimilarityClusterModel]:
-    """将相似照片聚类（Union-Find + 感知哈希）"""
+    """将相似照片聚类（Union-Find + 感知哈希）
+
+    precomputed_hashes: path -> ImageHash（来自 L1 流水阶段），传入后跳过
+    哈希计算阶段直接聚类；为 None 或缺失时回退到内部串行计算。
+    """
     paths = [str(p) for p in image_paths]
 
-    # 计算哈希（保留失败的照片不丢失）
+    # 计算哈希（优先复用流水阶段结果，缺失的照片单独计入 failed）
     hashes = {}
     failed = []
-    for p in paths:
-        h = compute_phash(p)
-        if h is not None:
-            hashes[p] = h
-        else:
-            failed.append(p)
+    if precomputed_hashes:
+        for p in paths:
+            h = precomputed_hashes.get(p)
+            if h is not None:
+                hashes[p] = h
+            else:
+                failed.append(p)
+    else:
+        for p in paths:
+            h = compute_phash(p)
+            if h is not None:
+                hashes[p] = h
+            else:
+                failed.append(p)
 
     # Union-Find 聚类
     valid = list(hashes.keys())

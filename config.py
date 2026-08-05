@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).parent
 PHOTOS_DIR = PROJECT_ROOT / "uploads"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 VIDEOS_DIR = PROJECT_ROOT / "uploads" / "videos"  # 视频文件存放目录（抽帧后保留）
+VIDEO_FRAMES_DIR = PHOTOS_DIR / "video_frames"  # 视频合格帧独立目录（与照片隔离，供视频榜）
 
 # 照片分类
 CATEGORIES = ["风景", "人像", "人文", "美食", "夜景", "自拍", "合照", "其他"]
@@ -83,6 +84,7 @@ DIVERSITY_DISTANCE_THRESHOLD = 10  # pHash 汉明距离低于此值视为相似
 VIDEO_FRAME_INTERVAL = 1.0  # 候选帧采样间隔（秒）
 VIDEO_MAX_FRAMES = 200  # 单视频候选帧上限（超出自动放大间隔）
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+VIDEO_OUTPUT_COUNT = 20  # 视频精选榜总名额（按各视频时长比例分配）
 # 视频帧模糊判定（照片阈值不适用：HEVC 压缩 + 4K 稀释使 Laplacian 天然偏低）
 # 绝对底线：低于此值视为解码异常/纯色帧，直接淘汰
 VIDEO_FRAME_MIN_SHARPNESS = 3.0

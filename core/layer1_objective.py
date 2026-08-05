@@ -156,3 +156,59 @@ def batch_analyze(image_paths: list[str | Path], max_workers: int = 4) -> list[L
                 )
 
     return [r for r in results if r is not None]
+
+
+def batch_analyze_with_phash(
+    image_paths: list[str | Path],
+    max_workers: int = 4,
+) -> tuple[list[Layer1Result], dict[str, object]]:
+    """批量分析照片 + 逐张流水计算感知哈希
+
+    worker 内"分析完即算哈希"（仅不 rejected 的照片），照片完成 L1 后
+    立即进入下一阶段工作，不等整批；哈希结果供 L2 聚类与融合多样性复用，
+    避免 L2 再串行重算一遍（大图 phash 1-3s/张）。
+
+    返回 (results, phash_map)：phash_map 为 path -> ImageHash。
+    """
+    from core.layer2_similarity import compute_phash
+
+    paths = [str(p) for p in image_paths]
+    results: list[Layer1Result | None] = [None] * len(paths)
+    phash_map: dict[str, object] = {}
+
+    def _work(p: str) -> tuple[ObjectiveScore, object | None]:
+        score = analyze_image(p)
+        h = None
+        if not score.rejected:
+            try:
+                h = compute_phash(p)
+            except Exception:
+                h = None
+        return score, h
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(_work, p): i for i, p in enumerate(paths)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                score, h = future.result()
+                results[idx] = Layer1Result(
+                    path=paths[idx],
+                    filename=Path(paths[idx]).name,
+                    sharpness=round(score.sharpness, 2),
+                    exposure=round(score.exposure, 4),
+                    noise=round(score.noise, 4),
+                    overall=round(score.overall, 4),
+                    rejected=score.rejected,
+                    reject_reason=score.reject_reason,
+                )
+                if h is not None:
+                    phash_map[paths[idx]] = h
+            except Exception as e:
+                logger.error(f"分析失败 {Path(paths[idx]).name}: {e}")
+                results[idx] = Layer1Result(
+                    path=paths[idx], filename=Path(paths[idx]).name,
+                    rejected=True, reject_reason="分析异常",
+                )
+
+    return [r for r in results if r is not None], phash_map

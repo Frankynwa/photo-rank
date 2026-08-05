@@ -2,14 +2,16 @@
 
 流程：OpenCV 逐帧读取 → 按 interval 采样候选帧（临时目录）→ 批量快筛
 （L1 客观淘汰 + L2 pHash 去重 + L4 闭眼淘汰，全部本地零 API）→
-合格帧复制到 out_dir（uploads 顶层），废帧随临时目录删除。
+合格帧复制到 out_dir（uploads/video_frames），废帧随临时目录删除。
 
 设计原则：
 - 候选帧只落临时目录，处理后即删，uploads 只保留合格帧
 - 完全复用 L1/L2/L4 的现有函数，不复制筛选逻辑
 - 长视频保护：候选帧超过 VIDEO_MAX_FRAMES 时自动放大采样间隔
+- 落盘帧命名含时间戳（t{秒}），并输出 manifest.json 记录来源视频/时间戳/客观分
 """
 import hashlib
+import json
 import logging
 import shutil
 import tempfile
@@ -55,20 +57,20 @@ def _empty_stats(total_frames: int = 0) -> dict:
     }
 
 
-def _filter_batch(candidate_paths: list[Path], kept: list[tuple[Path, object, float]], stats: dict) -> None:
-    """批量快筛：曝光淘汰 → 绝对模糊底线 → pHash 去重 → 累积（含 sharpness）
+def _filter_batch(candidate_paths: list[Path], kept: list[tuple[Path, object, float, float]], stats: dict) -> None:
+    """批量快筛：曝光淘汰 → 绝对模糊底线 → pHash 去重 → 累积（含 sharpness + L1 客观分）
 
     模糊的"批内相对淘汰"不在此处做，而是在全部候选帧读完后统一计算
     （见 _apply_relative_blur_filter），保证阈值基于完整批次而非单个子批。
 
     Args:
         candidate_paths: 本批候选帧（临时目录内的 JPEG）
-        kept: 已保留帧 [(临时路径, phash, sharpness), ...]，去重时与新帧比较
+        kept: 已保留帧 [(临时路径, phash, sharpness, l1_overall), ...]，去重时与新帧比较
         stats: 统计字典（就地累加）
     """
     # 1. L1 客观分析（多线程，复用现有实现）
     results = batch_analyze(candidate_paths)
-    keep_paths: list[tuple[Path, float]] = []
+    keep_paths: list[tuple[Path, float, float]] = []
     for p, r in zip(candidate_paths, results):
         # 曝光异常（过曝/欠曝）直接淘汰；模糊不用 L1 的绝对阈值（照片阈值对视频帧过严）
         if "过曝" in r.reject_reason or "欠曝" in r.reject_reason:
@@ -78,36 +80,36 @@ def _filter_batch(candidate_paths: list[Path], kept: list[tuple[Path, object, fl
         if r.sharpness < VIDEO_FRAME_MIN_SHARPNESS:
             stats["blurry"] += 1
             continue
-        keep_paths.append((p, r.sharpness))
+        keep_paths.append((p, r.sharpness, r.overall))
 
     # 2. L2 pHash 去重（与已保留帧比较，连续画面高度相似只留一帧）
-    dedup: list[tuple[Path, object, float]] = []
-    for p, sharpness in keep_paths:
+    dedup: list[tuple[Path, object, float, float]] = []
+    for p, sharpness, overall in keep_paths:
         h = compute_phash(p)
         if h is None:
             stats["failed"] += 1
             continue
-        if any(abs(int(h - old_h)) < HAMMING_THRESHOLD for _p, old_h, _s in kept):
+        if any(abs(int(h - old_h)) < HAMMING_THRESHOLD for _p, old_h, _s, _o in kept):
             stats["dup"] += 1
             continue
-        dedup.append((p, h, sharpness))
+        dedup.append((p, h, sharpness, overall))
 
     # 3. L4 人脸闭眼淘汰（批量）
     if dedup:
         blink_map: dict[str, bool] = {}
         try:
-            faces = analyze_faces([str(p) for p, _, _ in dedup])
+            faces = analyze_faces([str(p) for p, _, _, _ in dedup])
             blink_map = {
                 Path(r.path).name: r.blink_detected
                 for r in faces if r.has_face
             }
         except Exception as e:
             logger.debug(f"人脸批分析失败: {e}")
-        for p, h, sharpness in dedup:
+        for p, h, sharpness, overall in dedup:
             if blink_map.get(Path(p).name):
                 stats["blink"] += 1
                 continue
-            kept.append((p, h, sharpness))
+            kept.append((p, h, sharpness, overall))
 
 
 def _apply_relative_blur_filter(
@@ -121,11 +123,11 @@ def _apply_relative_blur_filter(
     """
     if len(kept) < 4:
         return
-    laps = [s for _p, _h, s in kept]
+    laps = [s for _p, _h, s, _o in kept]
     rel_thr = float(np.percentile(laps, VIDEO_FRAME_BLUR_RATIO * 100))
     thr = max(rel_thr, VIDEO_FRAME_MIN_SHARPNESS)
     before = len(kept)
-    kept[:] = [(p, h, s) for p, h, s in kept if s >= thr]
+    kept[:] = [(p, h, s, o) for p, h, s, o in kept if s >= thr]
     stats["blurry"] += before - len(kept)
     if before - len(kept):
         logger.debug(f"相对模糊淘汰: {before - len(kept)} 帧（阈值 Laplacian={thr:.1f}）")
@@ -180,7 +182,7 @@ def extract_quality_frames(
             f"采样步长 {step}帧（约 {interval:.1f}s/帧）"
         )
 
-        kept: list[tuple[Path, object, float]] = []
+        kept: list[tuple[Path, object, float, float]] = []
 
         with tempfile.TemporaryDirectory(prefix="pr_frames_") as tmp:
             tmp_dir = Path(tmp)
@@ -219,19 +221,53 @@ def extract_quality_frames(
                     f"未能从视频中读取任何帧，文件可能损坏: {video_path.name}"
                 )
 
-            # 合格帧复制到 out_dir（文件名带视频名+唯一签名+序号，可辨识来源且不冲突）
+            # 合格帧复制到 out_dir（文件名带视频名+签名+时间戳，可辨识来源且不冲突）
             # 签名用 size+mtime 哈希：同一文件名的视频内容更新后，帧名变化，避免旧帧被静默跳过
             sig = hashlib.md5(
                 f"{video_path.stat().st_size}:{video_path.stat().st_mtime_ns}".encode()
             ).hexdigest()[:6]
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = []
-            for i, (fpath, _h, _s) in enumerate(kept, 1):
-                dst = out_dir / f"{video_path.stem}_{sig}_frame_{i:03d}.jpg"
+            manifest_entries = []
+            for i, (fpath, h, sharpness, overall) in enumerate(kept, 1):
+                # 从临时文件名 cand_{frame_idx:06d}.jpg 解析帧号，换算视频内时间戳
+                try:
+                    frame_idx = int(fpath.stem.split("_")[1])
+                except (IndexError, ValueError):
+                    frame_idx = (i - 1) * step
+                ts = round(frame_idx / fps, 2)
+                dst = out_dir / f"{video_path.stem}_{sig}_t{int(round(ts)):03d}.jpg"
                 shutil.copy2(fpath, dst)
                 saved.append(dst.name)
+                manifest_entries.append({
+                    "filename": dst.name,
+                    "source_video": video_path.name,
+                    "timestamp": ts,
+                    "sharpness": round(sharpness, 2),
+                    "overall": round(overall, 4),
+                    "phash": str(h),
+                    "duration": round(duration, 2),
+                })
             stats["kept"] = len(saved)
             stats["saved"] = saved
+            stats["manifest"] = manifest_entries
+            # manifest.json：供视频榜排名读取来源/时间戳/客观分/哈希
+            # 多视频累积合并，避免后上传的视频覆盖前面的条目
+            try:
+                all_entries = list(manifest_entries)
+                old_mf = out_dir / "manifest.json"
+                if old_mf.exists():
+                    try:
+                        with open(old_mf, "r", encoding="utf-8") as f:
+                            old = json.load(f)
+                        if isinstance(old, list):
+                            all_entries = old + manifest_entries
+                    except Exception as e:
+                        logger.warning(f"读取旧 manifest 失败，仅保留本次条目: {e}")
+                with open(out_dir / "manifest.json", "w", encoding="utf-8") as f:
+                    json.dump(all_entries, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"manifest.json 写入失败: {e}")
 
         logger.info(
             f"视频抽帧完成: 候选{stats['candidates']} → 保留{stats['kept']} "

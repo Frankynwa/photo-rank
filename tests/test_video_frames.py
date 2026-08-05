@@ -65,9 +65,22 @@ class TestExtractQualityFrames:
         assert stats["kept"] >= 1, "清晰帧应至少保留 1 帧"
         assert stats["blurry"] <= 4, "相对淘汰只淘汰最低 30% 左右"
         assert len(stats["saved"]) == stats["kept"]
-        # 落盘文件存在
+        # 落盘文件存在，命名含时间戳（t{秒}）
         for name in stats["saved"]:
             assert (out / name).exists()
+            assert "_t" in name, f"帧命名应含时间戳: {name}"
+        # manifest.json 存在且字段完整
+        mf = out / "manifest.json"
+        assert mf.exists(), "应输出 manifest.json"
+        import json
+        manifest = json.loads(mf.read_text(encoding="utf-8"))
+        assert len(manifest) == stats["kept"]
+        for entry in manifest:
+            assert entry["filename"] in stats["saved"]
+            assert entry["source_video"] == "clear.mp4"
+            assert entry["timestamp"] >= 0
+            assert "sharpness" in entry and "overall" in entry
+            assert "phash" in entry and "duration" in entry
 
     def test_blurry_frames_rejected(self, tmp_path: Path):
         """纯色（模糊）帧应全部被 L1 淘汰"""
@@ -93,7 +106,7 @@ class TestExtractQualityFrames:
         cv2.imwrite(str(p2), frame)  # 内容完全一致
 
         stats = {"blurry": 0, "dup": 0, "blink": 0, "failed": 0}
-        kept = [(p1, compute_phash(p1), 100.0)]
+        kept = [(p1, compute_phash(p1), 100.0, 0.8)]
         with patch("core.video_frames.analyze_faces", side_effect=_no_faces):
             _filter_batch([p2], kept, stats)
 
@@ -125,7 +138,7 @@ class TestExtractQualityFrames:
 class TestRelativeBlurFilter:
     def _mk_kept(self, sharpness_list):
         return [
-            (Path(f"/tmp/{i}.jpg"), object(), float(s))
+            (Path(f"/tmp/{i}.jpg"), object(), float(s), 0.8)
             for i, s in enumerate(sharpness_list)
         ]
 

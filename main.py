@@ -25,6 +25,7 @@ from config import (
     PORT,
     PROJECT_ROOT,
     VIDEO_EXTS,
+    VIDEO_FRAMES_DIR,
     VIDEOS_DIR,
 )
 from config import (
@@ -213,7 +214,7 @@ async def upload_video(request: Request, file: UploadFile = File(...)):
 
     try:
         stats = await asyncio.to_thread(
-            extract_quality_frames, video_path, UPLOADS_DIR,
+            extract_quality_frames, video_path, VIDEO_FRAMES_DIR,
         )
     except VideoExtractError as e:
         video_path.unlink(missing_ok=True)  # 失败不残留垃圾视频文件
@@ -276,18 +277,30 @@ async def delete_photo(filename: str):
 
 @app.get("/api/results/{platform}")
 async def get_results(platform: str):
-    """获取分析结果（含路径遍历防护）"""
+    """获取分析结果（双榜单：照片榜 + 视频榜，含路径遍历防护）"""
     safe_platform = secure_filename(platform)
     if safe_platform != platform:
         raise HTTPException(status_code=400, detail="非法平台名")
-    ranking_file = OUTPUT_DIR / platform / "ranking.json"
+    platform_dir = OUTPUT_DIR / platform
+    ranking_file = platform_dir / "ranking.json"
     if not ranking_file.exists():
         raise HTTPException(status_code=404, detail="未找到分析结果")
 
     with open(ranking_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        photos = json.load(f)
 
-    return {"results": data, "total": len(data)}
+    videos = []
+    video_file = platform_dir / "video_ranking.json"
+    if video_file.exists():
+        with open(video_file, "r", encoding="utf-8") as f:
+            videos = json.load(f)
+
+    return {
+        "photos": photos,
+        "videos": videos,
+        "total": len(photos),
+        "video_total": len(videos),
+    }
 
 
 @app.get("/api/results/{platform}/{filename}")
@@ -313,7 +326,7 @@ async def analyze_photos(platform: str = "xiaohongshu"):
 
     async with _analysis_lock:
         await manager.broadcast({"type": "analysis_start", "platform": platform})
-        from core.pipeline import run_pipeline
+        from core.pipeline import run_pipeline, run_video_ranking
 
         try:
             loop = asyncio.get_running_loop()
@@ -327,6 +340,13 @@ async def analyze_photos(platform: str = "xiaohongshu"):
             result = await asyncio.to_thread(
                 run_pipeline, platform=platform, progress_callback=progress_callback,
             )
+            # 视频精选榜：照片榜之后运行（输出文件最后写入，不被照片榜清理）
+            video_result = await asyncio.to_thread(
+                run_video_ranking,
+                VIDEO_FRAMES_DIR,
+                platform=platform,
+                progress_callback=progress_callback,
+            )
 
             await manager.broadcast({
                 "type": "analysis_complete", "platform": platform,
@@ -334,9 +354,10 @@ async def analyze_photos(platform: str = "xiaohongshu"):
                     "total": result.get("total", 0),
                     "rejected": result.get("rejected", 0),
                     "output_count": result.get("output_count", 0),
+                    "video_count": video_result.get("output_count", 0),
                 },
             })
-            return result
+            return {"photos": result, "videos": video_result}
         except Exception as e:
             logger.error(f"[Analyze] 分析流水线异常: {e}")
             await manager.broadcast({"type": "analysis_error", "error": "分析过程出现内部错误，请稍后重试"})

@@ -167,6 +167,28 @@ class TestScoreRange:
             results = score_photos([p], device="cpu")
         assert results[0].aesthetic_score == 10.0
 
+    def test_score_clamped_above_ten(self, tmp_path):
+        """TOPIQ raw 分超范围时应钳制到 10.0（防分数体系崩坏）"""
+        mock_pyiqa, mock_torch = _build_mock_modules(score_value=4.85)  # raw 48.5
+        with patch.dict(sys.modules, {"pyiqa": mock_pyiqa, "torch": mock_torch}):
+            from core.layer3_aesthetic import score_photos
+            p = _make_random_image(tmp_path / "over.png")
+            results = score_photos([p], device="cpu")
+        r = results[0]
+        assert r.aesthetic_score == 10.0
+        assert r.overall_score == 10.0
+        assert r.final_score == 10.0
+
+    def test_score_clamped_below_zero(self, tmp_path):
+        """TOPIQ raw 分低于 0 时应钳制到 0.0"""
+        mock_pyiqa, mock_torch = _build_mock_modules(score_value=-0.5)  # raw -5.0
+        with patch.dict(sys.modules, {"pyiqa": mock_pyiqa, "torch": mock_torch}):
+            from core.layer3_aesthetic import score_photos
+            p = _make_random_image(tmp_path / "under.png")
+            results = score_photos([p], device="cpu")
+        assert results[0].aesthetic_score == 0.0
+        assert results[0].overall_score == 0.0
+
     def test_all_scores_equal_for_topiq(self, tmp_path):
         """TOPIQ-IAA 的四个分值应相同（源码中统一赋值）"""
         mock_pyiqa, mock_torch = _build_mock_modules(score_value=0.5)
@@ -345,3 +367,157 @@ class TestParseDimensionJson:
                 '"lighting_score": 7.0, "overall_aesthetic_score": 8.0, "category": 123}')
         out = _parse_dimension_json(text)
         assert "category" not in out
+
+
+# ---------------------------------------------------------------------------
+# VLM 人像硬伤钳制测试（程序化兜底，不依赖 LLM 自觉）
+# ---------------------------------------------------------------------------
+
+class TestHardFlagClamping:
+    def test_hard_flag_clamps_overall_to_6(self):
+        """人像硬伤（闭眼/主脸模糊）时综合审美应钳制至 6 分上限"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5,
+                "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
+                "reason": "构图不错但闭眼"}
+        _apply_dims_to_result(r, dims, hard_flag=True)
+        assert r.vlm_overall_score == 6.0
+        assert "已钳制至 6 分上限" in r.score_reason
+
+    def test_no_hard_flag_keeps_vlm_score(self):
+        """无人像硬伤时综合审美保持 VLM 原分"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5,
+                "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
+                "reason": "整体不错"}
+        _apply_dims_to_result(r, dims, hard_flag=False)
+        assert r.vlm_overall_score == 6.8
+        assert r.score_reason == "整体不错"
+
+    def test_hard_flag_below_6_not_raised(self):
+        """硬伤照片 VLM 分本就低于 6 时不应被抬高"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 5.0, "color_score": 5.0,
+                "lighting_score": 5.0, "overall_aesthetic_score": 5.5}
+        _apply_dims_to_result(r, dims, hard_flag=True)
+        assert r.vlm_overall_score == 5.5
+
+
+# ---------------------------------------------------------------------------
+# hard_flaws 解析与 VLM 自报硬伤钳制测试
+# ---------------------------------------------------------------------------
+
+class TestHardFlawsParsing:
+    def test_hard_flaws_extracted_deduped(self):
+        """hard_flaws 应被解析且去重保序"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "模糊且闭眼", "hard_flaws": ["模糊", "闭眼", "模糊"], '
+                '"composition_score": 3.0, "color_score": 5.0, '
+                '"lighting_score": 5.0, "overall_aesthetic_score": 6.0}')
+        out = _parse_dimension_json(text)
+        assert out["hard_flaws"] == ["模糊", "闭眼"]
+
+    def test_hard_flaws_invalid_ignored(self):
+        """非字符串/空串的 hard_flaws 应被忽略"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "ok", "hard_flaws": [123, "", "  "], '
+                '"composition_score": 5.0, "color_score": 5.0, '
+                '"lighting_score": 5.0, "overall_aesthetic_score": 6.0}')
+        out = _parse_dimension_json(text)
+        assert "hard_flaws" not in out
+
+    def test_vlm_hard_flaw_triggers_clamp(self):
+        """VLM 自报闭眼/人脸模糊也应触发钳制（辅助信号，即使 L4 未标记）"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5,
+                "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
+                "hard_flaws": ["闭眼"]}
+        _apply_dims_to_result(r, dims, hard_flag=False)  # L4 未标记
+        assert r.vlm_overall_score == 6.0  # VLM 自报闭眼 → 钳制
+        assert "闭眼" in r.hard_flaws
+
+    def test_non_face_flaw_no_clamp(self):
+        """非人像硬伤（如过曝）不应触发 6 分钳制"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5,
+                "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
+                "hard_flaws": ["过曝"]}
+        _apply_dims_to_result(r, dims, hard_flag=False)
+        assert r.vlm_overall_score == 6.8
+
+    def test_no_flaw_placeholder_filtered(self):
+        """prompt 要求无硬伤时填"无硬伤"占位符，不应被存入 hard_flaws"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "整体不错", "hard_flaws": ["无硬伤"], '
+                '"composition_score": 5.0, "color_score": 5.0, '
+                '"lighting_score": 5.0, "overall_aesthetic_score": 6.0}')
+        out = _parse_dimension_json(text)
+        assert "hard_flaws" not in out
+
+    def test_enum_whitelist_enforced(self):
+        """枚举白名单之外的硬伤字符串（LLM 幻觉项）应被忽略，白名单内保留"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "ok", "hard_flaws": ["颜色发灰", "模糊"], '
+                '"composition_score": 5.0, "color_score": 5.0, '
+                '"lighting_score": 5.0, "overall_aesthetic_score": 6.0}')
+        out = _parse_dimension_json(text)
+        assert out["hard_flaws"] == ["模糊"]
+
+    def test_hard_flaws_capped_at_5(self):
+        """hard_flaws 超过 5 个时应截断（去重保序后取前 5）"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "ok", "hard_flaws": ["模糊", "过曝", "欠曝", "噪点明显", "歪斜", "画面杂乱", "主体裁切"], '
+                '"composition_score": 5.0, "color_score": 5.0, '
+                '"lighting_score": 5.0, "overall_aesthetic_score": 6.0}')
+        out = _parse_dimension_json(text)
+        assert out["hard_flaws"] == ["模糊", "过曝", "欠曝", "噪点明显", "歪斜"]
+
+
+# ---------------------------------------------------------------------------
+# VLM 综合分批次归一化测试（防分数膨胀）
+# ---------------------------------------------------------------------------
+
+class TestNormalizeVlmBatch:
+    def test_spreads_scores(self):
+        """多张 VLM 分应被 p5-p95 拉伸拉开区分度，保持单调，且最低分不为精确 0（避免被误判为未评分）"""
+        from core.layer3_aesthetic import _normalize_vlm_batch
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", vlm_overall_score=s)
+            for i, s in enumerate([5.0, 6.0, 7.0, 8.0, 9.0], 1)
+        ]
+        _normalize_vlm_batch(results)
+        scores = [r.vlm_overall_score for r in results]
+        assert scores[0] == 0.1  # 正下限 0.01*10
+        assert scores[-1] == 10.0
+        assert scores == sorted(scores)
+
+    def test_single_no_change(self):
+        """单张照片不应被归一化"""
+        from core.layer3_aesthetic import _normalize_vlm_batch
+        r = Layer3Result(path="/x/1", filename="1.jpg", vlm_overall_score=7.5)
+        _normalize_vlm_batch([r])
+        assert r.vlm_overall_score == 7.5
+
+    def test_zero_scores_skipped(self):
+        """vlm_overall_score=0（未评分）的照片不参与归一化"""
+        from core.layer3_aesthetic import _normalize_vlm_batch
+        r0 = Layer3Result(path="/x/0", filename="0.jpg", vlm_overall_score=0.0)
+        r1 = Layer3Result(path="/x/1", filename="1.jpg", vlm_overall_score=8.0)
+        _normalize_vlm_batch([r0, r1])
+        assert r0.vlm_overall_score == 0.0
+        assert r1.vlm_overall_score == 8.0  # 仅 1 个有效分，不归一化
+
+    def test_concentrated_no_change(self):
+        """分数分布集中时保持不变，避免噪声放大"""
+        from core.layer3_aesthetic import _normalize_vlm_batch
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", vlm_overall_score=6.0)
+            for i in range(3)
+        ]
+        _normalize_vlm_batch(results)
+        assert all(r.vlm_overall_score == 6.0 for r in results)

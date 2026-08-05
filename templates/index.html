@@ -292,6 +292,42 @@
             gap: 18px;
             margin-bottom: 24px;
         }
+        /* 双榜 Tab 切换 */
+        .result-tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 18px;
+        }
+        .tab-btn {
+            padding: 8px 20px;
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 14px;
+            transition: all var(--transition);
+        }
+        .tab-btn:hover {
+            border-color: var(--border-hover);
+        }
+        .tab-btn.active {
+            background: var(--accent);
+            color: #fff;
+            border-color: var(--accent);
+        }
+        /* 视频帧来源标签 */
+        .video-source {
+            font-size: 12px;
+            color: var(--accent);
+            background: rgba(99, 102, 241, 0.08);
+            border-radius: 6px;
+            padding: 3px 8px;
+            margin-bottom: 6px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
         .photo-card {
             background: var(--bg-card);
             border-radius: var(--radius);
@@ -534,8 +570,8 @@
             <div class="progress-steps" id="progressSteps">
                 <span class="step" data-layer="1">L1 客观</span>
                 <span class="step" data-layer="2">L2 相似</span>
-                <span class="step" data-layer="3">L3 审美</span>
-                <span class="step" data-layer="4">L4 人脸</span>
+                <span class="step" data-layer="3">L4 人脸</span>
+                <span class="step" data-layer="4">L3 审美</span>
             </div>
         </div>
 
@@ -558,8 +594,16 @@
             </div>
         </div>
 
+        <!-- 结果区：双榜 Tab -->
+        <div class="result-tabs" id="resultTabs" style="display: none;">
+            <button class="tab-btn active" data-tab="photos">📷 照片精选</button>
+            <button class="tab-btn" data-tab="videos">🎬 视频精选</button>
+        </div>
+
         <!-- 照片网格 -->
         <div class="photo-grid" id="photoGrid"></div>
+        <!-- 视频网格（双榜） -->
+        <div class="photo-grid" id="videoGrid" style="display: none;"></div>
     </div>
 
     <!-- 详情弹窗 -->
@@ -578,6 +622,8 @@
         // 状态
         let photos = [];
         let results = [];
+        let videoResults = [];
+        let activeTab = 'photos';
 
         // ── WebSocket（含自动重连） ──
         let ws = null;
@@ -781,7 +827,16 @@ async function uploadVideo(file) {
             try {
                 const response = await fetch(`/api/results/xiaohongshu`);
                 const data = await response.json();
-                results = data.results;
+                results = data.photos || [];
+                videoResults = data.videos || [];
+
+                // 有视频榜时显示 Tab 切换
+                const tabs = document.getElementById('resultTabs');
+                tabs.style.display = videoResults.length > 0 ? 'flex' : 'none';
+                if (videoResults.length === 0) {
+                    document.getElementById('photoGrid').style.display = 'grid';
+                    document.getElementById('videoGrid').style.display = 'none';
+                }
 
                 renderResults();
                 updateStats();
@@ -790,22 +845,48 @@ async function uploadVideo(file) {
             }
         }
 
-        // 渲染结果
+        // Tab 切换
+        document.getElementById('resultTabs').addEventListener('click', (e) => {
+            const btn = e.target.closest('.tab-btn');
+            if (!btn) return;
+            activeTab = btn.dataset.tab;
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b === btn));
+            document.getElementById('photoGrid').style.display = activeTab === 'photos' ? 'grid' : 'none';
+            document.getElementById('videoGrid').style.display = activeTab === 'videos' ? 'grid' : 'none';
+        });
+
+        // 渲染结果（双榜）
         function renderResults() {
-            const grid = document.getElementById('photoGrid');
+            renderGrid('photoGrid', results, false);
+            renderGrid('videoGrid', videoResults, true);
+        }
+
+        // 秒数 → mm:ss
+        function formatTime(sec) {
+            const s = Math.max(0, Math.floor(Number(sec) || 0));
+            const m = Math.floor(s / 60);
+            return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+        }
+
+        function renderGrid(gridId, items, isVideo) {
+            const grid = document.getElementById(gridId);
             grid.innerHTML = '';
 
-            results.forEach((result, index) => {
+            items.forEach((result, index) => {
                 const card = document.createElement('div');
                 card.className = 'photo-card';
                 card.style.position = 'relative';
 
                 const classification = result.category || '';
+                const sourceTag = isVideo && result.source_video
+                    ? `<div class="video-source">🎬 ${result.source_video} · ${formatTime(result.timestamp)}</div>`
+                    : '';
 
                 card.innerHTML = `
                     <div class="rank">${index + 1}</div>
                     <img src="/api/results/xiaohongshu/${result.filename}" alt="${result.filename}">
                     <div class="info">
+                        ${sourceTag}
                         <div class="filename">${result.filename}</div>
                         <div class="score">
                             <span>审美分</span>
@@ -829,7 +910,7 @@ async function uploadVideo(file) {
             document.getElementById('stats').style.display = 'grid';
             document.getElementById('statTotal').textContent = photos.length;
             document.getElementById('statRejected').textContent = photos.length - results.length;
-            document.getElementById('statOutput').textContent = results.length;
+            document.getElementById('statOutput').textContent = results.length + (videoResults.length ? ` + ${videoResults.length} 视频` : '');
         }
 
         // 显示详情
@@ -840,7 +921,12 @@ async function uploadVideo(file) {
 
             modalImage.src = `/api/results/xiaohongshu/${result.filename}`;
 
+            const sourceInfo = result.source_video
+                ? `<h3>🎬 来源视频</h3><p>${result.source_video} · 时间 ${formatTime(result.timestamp)}</p>`
+                : '';
+
             modalAnalysis.innerHTML = `
+                ${sourceInfo}
                 <h3>📊 评分</h3>
                 <p>审美分: ${result.aesthetic_score} | 综合分: ${result.final_score}</p>
 
@@ -871,7 +957,11 @@ async function uploadVideo(file) {
 
             photos = [];
             results = [];
+            videoResults = [];
             renderPhotos();
+            document.getElementById('resultTabs').style.display = 'none';
+            document.getElementById('videoGrid').style.display = 'none';
+            document.getElementById('photoGrid').style.display = 'grid';
             document.getElementById('stats').style.display = 'none';
             showStatus('已清空所有照片', 'info');
         });
@@ -917,7 +1007,7 @@ async function uploadVideo(file) {
         }
 
         // ── 进度条逻辑 ──
-        const LAYER_NAMES = { 0: '准备', 1: '客观指标', 2: '相似聚类', 3: '审美评分', 4: '人脸质量' };
+        const LAYER_NAMES = { 0: '准备', 1: '客观指标', 2: '相似聚类', 3: '人脸质量', 4: '审美评分' };
 
         function showProgress(visible) {
             document.getElementById('progressContainer').classList.toggle('show', visible);

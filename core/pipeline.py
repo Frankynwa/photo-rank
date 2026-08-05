@@ -1,6 +1,7 @@
 """Pipeline — 整合所有层的完整流水线（支持 GPU/CPU 自动切换 + 断点续传）"""
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -177,7 +178,7 @@ def run_pipeline(
     """
     from core.layer1_objective import batch_analyze_with_phash
     from core.layer2_similarity import cluster_photos
-    from core.layer3_aesthetic import apply_vlm_dimensions, score_topiq
+    from core.layer3_aesthetic import score_topiq
     from core.layer4_face import analyze_faces, to_face_prompt_summary
 
     photos_dir = Path(photos_dir or PHOTOS_DIR)
@@ -198,6 +199,13 @@ def run_pipeline(
     platform_config = PLATFORMS.get(platform, PLATFORMS["xiaohongshu"])
 
     logger.info(f"照片目录: {photos_dir} | 数量: {len(photos)} | 平台: {platform}")
+
+    # 顺带清理过期解码缓存（防 cache/images 无限增长；失败不影响流水线）
+    try:
+        from core.image_cache import clean_image_cache
+        clean_image_cache()
+    except Exception as e:
+        logger.debug(f"解码缓存清理失败（不影响流水线）: {e}")
 
     # ── 检查 checkpoint ──
     # 版本化：v2 的 completed_layer 为步骤编号（1=L1, 2=L2, 3=L4, 4=L3，L4 前置）。
@@ -297,7 +305,11 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
-    # ── Layer 4 + Layer 3-TOPIQ：层间并发（人脸分析 ∥ TOPIQ 推理，互不依赖）──
+    # ── Layer 4 + Layer 3-TOPIQ：层间并发 + VLM 图片级流水 ──
+    # L4 分析完一张立即发起该张的 VLM API 调用（与 TOPIQ 推理并行），
+    # 消除"等全部 L4 完成才启动 VLM"的空等（VLM 是网络 IO 最慢环节，提前启动收益最大）
+    vlm_tasks: list[tuple[str, object, bool]] = []  # (path, VLM future, hard_flag)
+    api_key = os.environ.get("QWEN_API_KEY", "")
     if checkpoint and checkpoint["completed_layer"] >= 3:
         face_results = [Layer4Result(**r) for r in checkpoint.get("face_results", [])]
         aes_topiq_results = []  # L3 将从 checkpoint 恢复或重跑 TOPIQ
@@ -306,9 +318,26 @@ def run_pipeline(
     else:
         _emit(progress_callback, "layer_start", layer=3, layer_name="人脸质量")
         from concurrent.futures import ThreadPoolExecutor
+        from core.layer3_aesthetic import _VLM_CONCURRENCY, _run_dimension_analysis
+        vlm_pool = None
         try:
+            # VLM 独立线程池（8 并发，网络 IO 密集；与 L4/TOPIQ 的 2-worker 池分离）
+            vlm_pool = ThreadPoolExecutor(max_workers=_VLM_CONCURRENCY)
+
+            def _on_face_done(r: Layer4Result) -> None:
+                """L4 分析完一张 → 立即发起该张 VLM API 调用（图片级流水）"""
+                if not api_key:
+                    return
+                fsum = to_face_prompt_summary(r)
+                hflag = r.main_face_blink or (r.has_face and r.face_clarity < 0.25)
+                vlm_tasks.append((
+                    r.path,
+                    vlm_pool.submit(_run_dimension_analysis, r.path, face_summary=fsum),
+                    hflag,
+                ))
+
             with ThreadPoolExecutor(max_workers=2) as pool:
-                f_face = pool.submit(analyze_faces, representatives)
+                f_face = pool.submit(analyze_faces, representatives, on_photo_done=_on_face_done)
                 f_topiq = pool.submit(score_topiq, representatives, "auto")
                 try:
                     face_results = f_face.result()
@@ -330,19 +359,21 @@ def run_pipeline(
             logger.error(f"[L4/L3-TOPIQ] 并发启动失败: {e}")
             face_results = []
             aes_topiq_results = []
+        finally:
+            if vlm_pool is not None:
+                vlm_pool.shutdown(wait=False)  # 已提交任务照常完成，L3 阶段 await
         _emit(progress_callback, "layer_end", layer=3, faces=len(face_results))
         _save_layer_checkpoint(output_dir, 3, {
             "face_results": [r.model_dump() for r in face_results],
             "skipped_layers": skipped_layers,
         })
 
-    # 派生 L4 产物：融合分映射 + VLM prompt 注入文案
+    # 派生 L4 产物：融合分映射（VLM prompt 注入文案已在图片级流水回调中逐张生成）
     face_scores = {r.path: r.overall_face_score for r in face_results}
     # 降级兜底：多人环境场景（≥6 张脸且主脸占比 < 10%）判定人脸为环境元素，不参与加分
     for r in face_results:
         if r.face_count >= 6 and r.face_ratio < 0.10:
             face_scores[r.path] = 0.0
-    face_summaries = {r.path: to_face_prompt_summary(r) for r in face_results}
     # 人像硬伤标记：主脸闭眼或主脸明显模糊（对应 prompt 硬伤预检第 9 条）
     # 作为 VLM 综合审美 6 分上限的程序化钳制依据（不依赖 LLM 自觉）
     face_hard_flags = {
@@ -350,7 +381,7 @@ def run_pipeline(
         for r in face_results
     }
 
-    # ── Layer 3: 审美评分（TOPIQ 已与 L4 并发完成，此处补 VLM 维度分析）──
+    # ── Layer 3: 审美评分（TOPIQ 已与 L4 并发完成，VLM API 已在 L4 回调阶段逐张发起）──
     if checkpoint and checkpoint["completed_layer"] >= 4:
         aes_results = [Layer3Result(**r) for r in checkpoint.get("aes_results", [])]
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
@@ -360,11 +391,56 @@ def run_pipeline(
         try:
             if not aes_topiq_results:
                 aes_topiq_results = score_topiq(representatives, "auto")
-            aes_results = apply_vlm_dimensions(
-                aes_topiq_results,
-                face_summaries=face_summaries,
-                face_hard_flags=face_hard_flags,
-            )
+            if api_key:
+                # 图片级流水：等待 VLM 任务完成并写入（任务已在 L4 回调阶段发起）
+                if not vlm_tasks:
+                    # 续传/降级路径：L4 从 checkpoint 恢复或 L4 失败，VLM 未提前发起 → 补齐逐张发起
+                    from concurrent.futures import ThreadPoolExecutor as _TPE
+                    from core.layer3_aesthetic import _VLM_CONCURRENCY, _run_dimension_analysis
+                    face_by_path = {r.path: r for r in face_results}
+                    with _TPE(max_workers=_VLM_CONCURRENCY) as vp:
+                        for r in aes_topiq_results:
+                            if r.error or r.path not in face_by_path:
+                                continue
+                            fr = face_by_path[r.path]
+                            vlm_tasks.append((
+                                r.path,
+                                vp.submit(
+                                    _run_dimension_analysis, r.path,
+                                    face_summary=to_face_prompt_summary(fr),
+                                ),
+                                fr.main_face_blink or (fr.has_face and fr.face_clarity < 0.25),
+                            ))
+                from core.layer3_aesthetic import (
+                    _apply_dims_to_result,
+                    _is_hard_flaw,
+                    _normalize_vlm_batch,
+                )
+                topiq_by_path = {r.path: r for r in aes_topiq_results}
+                for path, fut, hflag in vlm_tasks:
+                    r = topiq_by_path.get(path)
+                    if r is None or r.error:
+                        continue  # TOPIQ 失败的照片不写 VLM 分
+                    try:
+                        dims = fut.result()
+                    except Exception as e:
+                        logger.warning(f"维度分析失败 {r.filename}: {e}")
+                        dims = {}
+                    _apply_dims_to_result(r, dims, hard_flag=hflag)
+                # 与 apply_vlm_dimensions 一致的归一化 + 硬伤重新钳制
+                _normalize_vlm_batch(aes_topiq_results)
+                for r in aes_topiq_results:
+                    if r.vlm_overall_score > 6.0 and _is_hard_flaw(r, face_hard_flags):
+                        r.vlm_overall_score = 6.0
+                        if "已钳制至 6 分上限" not in r.score_reason:
+                            r.score_reason += "（人像硬伤，已钳制至 6 分上限）"
+            else:
+                # 无 API key：VLM 维度默认值 5.0（与 apply_vlm_dimensions 行为一致）
+                for result in aes_topiq_results:
+                    result.composition_score = 5.0
+                    result.color_score = 5.0
+                    result.lighting_score = 5.0
+            aes_results = aes_topiq_results
             aes_results.sort(key=lambda x: x.overall_score, reverse=True)
         except Exception as e:
             logger.error(f"[L3] 失败，跳过: {e}")
@@ -582,7 +658,7 @@ def _allocate_quotas(
         cap = max(1, int(total_quota * cap_ratio))
         for v in quotas:
             quotas[v] = min(quotas[v], cap)
-    # 超发收敛：按“占比偏差最大者”逐减（偏差大 = 分多了）
+    # 超发收敛：按"占比偏差最大者"逐减（偏差大 = 分多了）
     while sum(quotas.values()) > total_quota:
         cands = [v for v, q in quotas.items() if q > 1 and (cap is None or q > 1)]
         if not cands:
@@ -608,7 +684,7 @@ def run_video_ranking(
     progress_callback=None,
     max_total: int | None = None,
 ) -> dict:
-    """视频帧独立竞争排名（双榜单中的“视频精选榜”）
+    """视频帧独立竞争排名（双榜单中的"视频精选榜"）
 
     视频帧在抽帧时已过 L1/L2/L4 本地快筛，此处做跨视频聚类（L2）、
     L3 VLM + TOPIQ + 人脸深度评分与融合排名；最终名额按各视频时长
@@ -629,7 +705,8 @@ def run_video_ranking(
     frames_dir = Path(video_frames_dir or VIDEO_FRAMES_DIR)
     max_total = max_total or VIDEO_OUTPUT_COUNT
     platform_config = PLATFORMS.get(platform, PLATFORMS["xiaohongshu"])
-    output_dir = OUTPUT_DIR / platform
+    # 视频榜产物独立子目录（与照片榜物理分离：output/{platform}/videos/）
+    output_dir = OUTPUT_DIR / platform / "videos"
 
     manifest = _load_video_manifest(frames_dir)
     by_file = {frames_dir / m["filename"]: m for m in manifest if (frames_dir / m["filename"]).exists()}
@@ -749,7 +826,11 @@ def run_video_ranking(
     video_results = [_to_result(r) for r in selected]
 
     # 复制入选帧到 output_dir（序号名，供前端展示；与照片榜命名风格一致）
+    # 先清理上次运行的全部产物（展示副本 + 榜单 JSON），避免 vNN_ 序号跨运行累积
     output_dir.mkdir(parents=True, exist_ok=True)
+    for old in output_dir.glob("*"):
+        if old.is_file():
+            old.unlink()
     display_names: dict[str, str] = {}
     for i, r in enumerate(selected, 1):
         src = Path(r.path)

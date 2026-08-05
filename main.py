@@ -290,7 +290,7 @@ async def get_results(platform: str):
         photos = json.load(f)
 
     videos = []
-    video_file = platform_dir / "video_ranking.json"
+    video_file = platform_dir / "videos" / "video_ranking.json"
     if video_file.exists():
         with open(video_file, "r", encoding="utf-8") as f:
             videos = json.load(f)
@@ -301,6 +301,21 @@ async def get_results(platform: str):
         "total": len(photos),
         "video_total": len(videos),
     }
+
+
+@app.get("/api/results/{platform}/videos/{filename}")
+async def get_result_video(platform: str, filename: str):
+    """获取视频榜结果图片（独立子目录，与照片榜物理分离）"""
+    safe_platform = secure_filename(platform)
+    if safe_platform != platform:
+        raise HTTPException(status_code=400, detail="非法平台名")
+    safe_filename = secure_filename(filename)
+    if safe_filename != filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    filepath = OUTPUT_DIR / platform / "videos" / filename
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="照片不存在")
+    return FileResponse(filepath)
 
 
 @app.get("/api/results/{platform}/{filename}")

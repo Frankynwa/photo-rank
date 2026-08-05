@@ -877,6 +877,8 @@ async function uploadVideo(file) {
                 card.className = 'photo-card';
                 card.style.position = 'relative';
 
+                // 视频榜图片位于独立子目录（与照片榜物理分离）
+                const imgBase = isVideo ? '/api/results/xiaohongshu/videos' : '/api/results/xiaohongshu';
                 const classification = result.category || '';
                 const sourceTag = isVideo && result.source_video
                     ? `<div class="video-source">🎬 ${result.source_video} · ${formatTime(result.timestamp)}</div>`
@@ -884,7 +886,7 @@ async function uploadVideo(file) {
 
                 card.innerHTML = `
                     <div class="rank">${index + 1}</div>
-                    <img src="/api/results/xiaohongshu/${result.filename}" alt="${result.filename}">
+                    <img src="${imgBase}/${result.filename}" alt="${result.filename}">
                     <div class="info">
                         ${sourceTag}
                         <div class="filename">${result.filename}</div>
@@ -919,7 +921,9 @@ async function uploadVideo(file) {
             const modalImage = document.getElementById('modalImage');
             const modalAnalysis = document.getElementById('modalAnalysis');
 
-            modalImage.src = `/api/results/xiaohongshu/${result.filename}`;
+            // 视频条目带 source_video（非空）→ 从 videos 子目录取图
+            const imgBase = result.source_video ? '/api/results/xiaohongshu/videos' : '/api/results/xiaohongshu';
+            modalImage.src = `${imgBase}/${result.filename}`;
 
             const sourceInfo = result.source_video
                 ? `<h3>🎬 来源视频</h3><p>${result.source_video} · 时间 ${formatTime(result.timestamp)}</p>`

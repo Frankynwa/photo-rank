@@ -8,11 +8,12 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 
 from PIL import Image
 
-from config import VLM_IMAGE_MAX_SIDE
+from config import VLM_IMAGE_MAX_SIDE, VLM_JPEG_QUALITY
 from core.models import Layer3Result
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,32 @@ _VLM_TIMEOUT = 60  # 单次 API 超时（秒）
 _VLM_RETRIES = 3  # 失败重试次数（指数退避）
 _VLM_CONCURRENCY = 8  # VLM 维度分析并发数（网络 IO 密集，图片级流水）
 _VLM_DIM_KEYS = ("composition_score", "color_score", "lighting_score", "overall_aesthetic_score")
+
+# TOPIQ 模型模块级缓存：{实际device: (model, pyiqa模块引用)}
+# - 按 device 缓存避免每次运行重复加载（实测加载 ~4s，15 张纯推理仅 ~2s），
+#   照片榜/视频榜/多平台重跑共用同一缓存
+# - 缓存同时保存 pyiqa 模块引用，通过 `is` 身份校验区分真实模块与测试 mock：
+#   测试中 patch.dict(sys.modules) 替换 pyiqa 时缓存自动失效，不会误复用 mock 模型
+_topiq_model_cache: dict[str, tuple] = {}
+_topiq_model_lock = threading.Lock()
+
+
+def release_topiq_model(device: str | None = None) -> None:
+    """释放 TOPIQ 模型缓存（显存分时加载时调用；device=None 释放全部）
+
+    模型默认常驻缓存；接入 Q-Align/HumanAesExpert 等 GPU 模型需要腾显存时，
+    可先调用本函数再加载新模型（与显存分时加载策略兼容）。
+    """
+    with _topiq_model_lock:
+        keys = list(_topiq_model_cache) if device is None else [device]
+        for k in keys:
+            if k in _topiq_model_cache:
+                _topiq_model_cache.pop(k)
+                logger.info(f"已释放 TOPIQ 模型缓存: {k}")
+        if "cuda" in keys:
+            import torch
+            torch.cuda.empty_cache()
+        gc.collect()
 
 # VLM 分类标签枚举（与 prompt 中的分类清单保持一致）
 _CATEGORIES = ("风景", "建筑", "人像", "人文纪实", "美食", "动物", "夜景", "其他")
@@ -106,6 +133,11 @@ def score_topiq(
 ) -> list[Layer3Result]:
     """TOPIQ-IAA 客观审美评分（逐张推理 + 批次归一化），不含 VLM 维度分析
 
+    模型按 device 模块级缓存复用（实测加载 ~4s，缓存命中跳过）：
+    - 缓存键为实际 device（"cuda"/"cpu"），并校验 pyiqa 模块身份，
+      测试中 mock 替换 pyiqa 时缓存自动失效，不会误复用
+    - 显存紧张时可调用 release_topiq_model() 主动释放（分时加载场景）
+
     Args:
         image_paths: 照片路径列表
         device: "auto" | "cuda" | "cpu"
@@ -121,27 +153,38 @@ def score_topiq(
     if device == "cpu":
         logger.warning("CPU 推理，速度较慢")
 
-    # 加载模型（带容错 + CPU fallback）
-    try:
-        logger.info("加载 TOPIQ-IAA...")
-        model = pyiqa.create_metric("topiq_iaa", device=device)
-        logger.info("模型加载成功")
-    except Exception as e:
-        logger.error(f"模型加载失败: {e}")
-        if device != "cpu":
-            try:
-                logger.info("尝试 CPU fallback...")
-                model = pyiqa.create_metric("topiq_iaa", device="cpu")
-                device = "cpu"
-            except Exception as e2:
-                logger.error(f"CPU fallback 也失败: {e2}")
-                return [
-                    Layer3Result(
-                        path=str(p), filename=Path(p).name,
-                        error=str(e), device="cpu",
-                    )
-                    for p in image_paths
-                ]
+    # 加载模型（带容错 + CPU fallback + 模块级缓存复用）
+    model = None
+    with _topiq_model_lock:
+        cached = _topiq_model_cache.get(device)
+        if cached is not None and cached[1] is pyiqa:
+            model = cached[0]
+            logger.info(f"TOPIQ 模型缓存命中（{device}）")
+    if model is None:
+        try:
+            logger.info("加载 TOPIQ-IAA...")
+            model = pyiqa.create_metric("topiq_iaa", device=device)
+            with _topiq_model_lock:
+                _topiq_model_cache[device] = (model, pyiqa)
+            logger.info("模型加载成功")
+        except Exception as e:
+            logger.error(f"模型加载失败: {e}")
+            if device != "cpu":
+                try:
+                    logger.info("尝试 CPU fallback...")
+                    model = pyiqa.create_metric("topiq_iaa", device="cpu")
+                    device = "cpu"
+                    with _topiq_model_lock:
+                        _topiq_model_cache["cpu"] = (model, pyiqa)
+                except Exception as e2:
+                    logger.error(f"CPU fallback 也失败: {e2}")
+                    return [
+                        Layer3Result(
+                            path=str(p), filename=Path(p).name,
+                            error=str(e), device="cpu",
+                        )
+                        for p in image_paths
+                    ]
 
     results = []
     total = len(image_paths)
@@ -149,7 +192,8 @@ def score_topiq(
     try:
         for i, path in enumerate(image_paths):
             try:
-                img = Image.open(path).convert("RGB")
+                from core.image_cache import get_cached_path
+                img = Image.open(get_cached_path(path)).convert("RGB")
                 # TOPIQ-IAA 输出映射 [0,10]，raw 偶发超范围 → 钳制防分数体系崩坏
                 score = max(0.0, min(10.0, model(img).item() * 10))
                 results.append(Layer3Result(
@@ -175,11 +219,10 @@ def score_topiq(
             logger.info(f"显存占用: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
     finally:
-        del model
-        gc.collect()
+        # 模型保留在模块级缓存中复用，不再 del/empty_cache；
+        # 显存紧张时调用 release_topiq_model() 主动释放
         if device == "cuda":
-            torch.cuda.empty_cache()
-            logger.debug("GPU 显存已释放")
+            logger.debug("TOPIQ 模型常驻显存（模块级缓存），可调用 release_topiq_model() 释放")
 
     # TOPIQ 批次归一化：p5-p95 拉伸，拉开区分度
     _normalize_batch_scores(results)
@@ -429,14 +472,15 @@ async def _analyze_dimensions(
     - 指数退避重试 + 分数钳制 [1,10]
     """
     import httpx
+    from core.image_cache import get_cached_path
 
-    img = Image.open(image_path).convert("RGB")
+    img = Image.open(get_cached_path(image_path)).convert("RGB")
     w, h = img.size
     if max(w, h) > VLM_IMAGE_MAX_SIDE:
         ratio = VLM_IMAGE_MAX_SIDE / max(w, h)
         img = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=85)
+    img.save(buffer, format="JPEG", quality=VLM_JPEG_QUALITY)
     b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     prompt = _DIMENSION_PROMPT

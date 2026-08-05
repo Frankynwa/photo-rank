@@ -121,7 +121,8 @@ class FaceAnalyzer:
             return FaceQuality()
 
         try:
-            image = Image.open(image_path).convert("RGB")
+            from core.image_cache import get_cached_path
+            image = Image.open(get_cached_path(image_path)).convert("RGB")
             arr = np.array(image)
 
             import mediapipe as mp
@@ -194,11 +195,12 @@ class FaceAnalyzer:
             logger.debug(f"人脸分析失败 {Path(image_path).name}: {e}")
             return FaceQuality()
 
-    def batch_analyze(self, image_paths: list[str | Path]) -> list[Layer4Result]:
+    def batch_analyze(self, image_paths: list[str | Path], on_photo_done=None) -> list[Layer4Result]:
+        """批量人脸分析；on_photo_done 可选：每完成一张立即回调（图片级流水用）"""
         results = []
         for path in image_paths:
             quality = self.analyze_face(path)
-            results.append(Layer4Result(
+            r = Layer4Result(
                 path=str(path), filename=Path(path).name,
                 face_count=quality.face_count, has_face=quality.has_face,
                 blink_detected=quality.blink_detected,
@@ -208,18 +210,25 @@ class FaceAnalyzer:
                 face_ratio=quality.face_ratio,
                 second_face_ratio=quality.second_face_ratio,
                 main_face_blink=quality.main_face_blink,
-            ))
+            )
+            results.append(r)
+            if on_photo_done is not None:
+                on_photo_done(r)
         return results
 
 
-def analyze_faces(image_paths: list[str | Path]) -> list[Layer4Result]:
-    """批量人脸分析（复用全局实例，串行化调用保证线程安全）"""
+def analyze_faces(image_paths: list[str | Path], on_photo_done=None) -> list[Layer4Result]:
+    """批量人脸分析（复用全局实例，串行化调用保证线程安全）
+
+    on_photo_done 可选：每完成一张立即回调（Layer4Result），供流水线在
+    L4 分析期间逐张启动下游任务（如 VLM API 调用），实现图片级流水。
+    """
     global _global_analyzer
     with _global_analyzer_lock:
         if _global_analyzer is None:
             _global_analyzer = FaceAnalyzer()
     with _analyze_call_lock:
-        return _global_analyzer.batch_analyze(image_paths)
+        return _global_analyzer.batch_analyze(image_paths, on_photo_done=on_photo_done)
 
 
 def to_face_prompt_summary(r: Layer4Result) -> str:

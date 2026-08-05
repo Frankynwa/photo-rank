@@ -148,9 +148,10 @@ class _UnionFind:
 
 
 def compute_phash(image_path: str | Path) -> imagehash.ImageHash | None:
-    """计算感知哈希"""
+    """计算感知哈希（复用解码缓存，HEIC/超大图不重复解原图）"""
     try:
-        img = Image.open(image_path).convert("RGB")
+        from core.image_cache import get_cached_path
+        img = Image.open(get_cached_path(image_path)).convert("RGB")
         return imagehash.phash(img)
     except Exception as e:
         logger.warning(f"哈希计算失败 {Path(image_path).name}: {e}")

@@ -330,6 +330,44 @@ class TestModelLoading:
 
 
 # ---------------------------------------------------------------------------
+# TOPIQ 模型模块级缓存测试（按 device 复用，pyiqa 身份校验防 mock 误命中）
+# ---------------------------------------------------------------------------
+
+class TestTopiqModelCache:
+    def test_same_module_reuses_model(self, tmp_path):
+        """同一 pyiqa 模块再次评分应复用缓存模型（create_metric 仅调用一次）"""
+        mock_pyiqa, mock_torch = _build_mock_modules(score_value=0.6)
+        with patch.dict(sys.modules, {"pyiqa": mock_pyiqa, "torch": mock_torch}):
+            from core.layer3_aesthetic import score_topiq
+            p1 = _make_random_image(tmp_path / "a.png")
+            p2 = _make_random_image(tmp_path / "b.png")
+            score_topiq([p1], device="cpu")
+            score_topiq([p2], device="cpu")
+        assert mock_pyiqa.create_metric.call_count == 1
+
+    def test_different_module_reloads(self, tmp_path):
+        """pyiqa 模块身份变化（测试 mock 替换）时缓存应失效并重新加载"""
+        from core.layer3_aesthetic import score_topiq
+        for i in range(2):
+            mock_pyiqa, mock_torch = _build_mock_modules(score_value=0.6)
+            with patch.dict(sys.modules, {"pyiqa": mock_pyiqa, "torch": mock_torch}):
+                p = _make_random_image(tmp_path / f"img{i}.png")
+                score_topiq([p], device="cpu")
+                assert mock_pyiqa.create_metric.call_count == 1
+
+    def test_release_topiq_model(self, tmp_path):
+        """release_topiq_model 应清空缓存，再次评分重新加载"""
+        from core.layer3_aesthetic import release_topiq_model, score_topiq
+        mock_pyiqa, mock_torch = _build_mock_modules(score_value=0.6)
+        with patch.dict(sys.modules, {"pyiqa": mock_pyiqa, "torch": mock_torch}):
+            p = _make_random_image(tmp_path / "a.png")
+            score_topiq([p], device="cpu")
+            release_topiq_model("cpu")
+            score_topiq([p], device="cpu")
+        assert mock_pyiqa.create_metric.call_count == 2
+
+
+# ---------------------------------------------------------------------------
 # VLM 分类标签解析测试
 # ---------------------------------------------------------------------------
 

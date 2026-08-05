@@ -12,6 +12,7 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).parent
 PHOTOS_DIR = PROJECT_ROOT / "uploads"
 OUTPUT_DIR = PROJECT_ROOT / "output"
+VIDEOS_DIR = PROJECT_ROOT / "uploads" / "videos"  # 视频文件存放目录（抽帧后保留）
 
 # 照片分类
 CATEGORIES = ["风景", "人像", "人文", "美食", "夜景", "自拍", "合照", "其他"]
@@ -77,6 +78,16 @@ FINAL_OUTPUT_COUNT = 12
 # 又不至于让一张好照片因轻微相似就被完全挤出榜单。
 DIVERSITY_PENALTY = 0.15
 DIVERSITY_DISTANCE_THRESHOLD = 10  # pHash 汉明距离低于此值视为相似
+
+# 视频抽帧：流式逐帧筛选，不合格帧不落盘
+VIDEO_FRAME_INTERVAL = 2.0  # 候选帧采样间隔（秒）
+VIDEO_MAX_FRAMES = 200  # 单视频候选帧上限（超出自动放大间隔）
+VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+# 视频帧模糊判定（照片阈值不适用：HEVC 压缩 + 4K 稀释使 Laplacian 天然偏低）
+# 绝对底线：低于此值视为解码异常/纯色帧，直接淘汰
+VIDEO_FRAME_MIN_SHARPNESS = 3.0
+# 批内相对淘汰比例：按 Laplacian 排序淘汰最低的 30%（运动模糊/失焦帧）
+VIDEO_FRAME_BLUR_RATIO = 0.3
 
 # Layer 3: VLM 评分前将图片长边缩放到此尺寸（减小上传体积、提速）
 VLM_IMAGE_MAX_SIDE = 1024

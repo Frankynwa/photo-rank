@@ -542,6 +542,15 @@
             <input type="file" id="fileInput" multiple accept="image/*" style="display: none;">
         </div>
 
+        <!-- 视频上传区域（流式抽帧，只保留合格帧） -->
+        <div class="upload-zone" id="videoUploadZone" style="margin-top: 12px;">
+            <span class="upload-icon">🎬</span>
+            <h3>上传视频，自动抽帧筛选</h3>
+            <p>支持 MP4、MOV、AVI 等 — 每 2 秒采一帧，本地快筛（清晰度/去重/闭眼）后只保留合格帧</p>
+            <input type="file" id="videoInput" accept="video/*" style="display: none;">
+        </div>
+        <div id="videoStats" class="video-stats" style="display: none;"></div>
+
         <!-- 控制按钮 -->
         <div class="controls">
             <button class="btn btn-primary" id="analyzeBtn" disabled>🚀 开始分析</button>
@@ -709,6 +718,48 @@
                 loadPhotos();
             } catch (error) {
                 showStatus('上传失败: ' + error.message, 'error');
+            }
+        }
+
+        // ── 视频上传：流式抽帧 + 本地快筛 ──
+const videoUploadZone = document.getElementById('videoUploadZone');
+const videoInput = document.getElementById('videoInput');
+const videoStats = document.getElementById('videoStats');
+
+videoUploadZone.addEventListener('click', () => videoInput.click());
+videoUploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+videoUploadZone.classList.add('dragover');
+        });
+videoUploadZone.addEventListener('dragleave', () => {
+videoUploadZone.classList.remove('dragover');
+        });
+videoUploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+videoUploadZone.classList.remove('dragover');
+            const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('video/'));
+            if (files.length) uploadVideo(files[0]);
+        });
+videoInput.addEventListener('change', (e) => {
+            if (e.target.files.length) uploadVideo(e.target.files[0]);
+            e.target.value = '';  // 允许重复选同一文件
+        });
+
+async function uploadVideo(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            showStatus(`正在处理视频 ${file.name}（流式抽帧 + 本地快筛）...`, 'info');
+            try {
+                const resp = await fetch('/api/upload_video', { method: 'POST', body: formData });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.detail || '上传失败');
+                videoStats.style.display = 'block';
+                videoStats.innerHTML = `🎬 <b>${data.video}</b>：候选 <b>${data.stats.candidates}</b> 帧 → 保留 <b>${data.stats.kept}</b> 帧` +
+                    `（淘汰：模糊 ${data.stats.blurry} / 重复 ${data.stats.dup} / 闭眼 ${data.stats.blink} / 失败 ${data.stats.failed}）`;
+                showStatus(`视频抽帧完成：保留 ${data.stats.kept} 帧，已加入照片列表`, 'success');
+                loadPhotos();
+            } catch (e) {
+                showStatus(`视频处理失败: ${e.message}`, 'error');
             }
         }
 

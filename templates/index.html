@@ -176,39 +176,6 @@
             background: var(--bg-card);
         }
 
-        /* ── Platform Selector ── */
-        .platform-selector {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 24px;
-            background: var(--bg-secondary);
-            padding: 6px;
-            border-radius: var(--radius);
-            border: 1px solid var(--border-color);
-        }
-        .platform-btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: var(--radius-sm);
-            background: transparent;
-            color: var(--text-secondary);
-            cursor: pointer;
-            transition: all var(--transition);
-            font-size: 14px;
-            font-weight: 500;
-            flex: 1;
-            text-align: center;
-        }
-        .platform-btn.active {
-            background: var(--accent);
-            color: white;
-            box-shadow: 0 2px 12px var(--accent-glow);
-        }
-        .platform-btn:hover:not(.active) {
-            background: var(--bg-card);
-            color: var(--text-primary);
-        }
-
         /* ── Progress ── */
         .progress-container {
             padding: 24px;
@@ -504,8 +471,6 @@
             .photo-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
             .photo-card img { height: 140px; }
             .photo-card .info { padding: 12px; }
-            .platform-selector { flex-direction: column; gap: 4px; }
-            .platform-btn { padding: 10px 14px; }
             .controls { flex-direction: column; }
             .btn { justify-content: center; }
             .stats { grid-template-columns: repeat(3, 1fr); gap: 8px; }
@@ -557,13 +522,6 @@
             <button class="btn btn-secondary" id="clearBtn">🗑️ 清空照片</button>
         </div>
 
-        <!-- 平台选择 -->
-        <div class="platform-selector">
-            <button class="platform-btn active" data-platform="xiaohongshu">📱 小红书</button>
-            <button class="platform-btn" data-platform="wechat">💬 朋友圈</button>
-            <button class="platform-btn" data-platform="douyin">🎵 抖音</button>
-        </div>
-
         <!-- 进度条 -->
         <div class="progress-container" id="progressContainer">
             <div class="progress-header">
@@ -578,7 +536,6 @@
                 <span class="step" data-layer="2">L2 相似</span>
                 <span class="step" data-layer="3">L3 审美</span>
                 <span class="step" data-layer="4">L4 人脸</span>
-                <span class="step" data-layer="5">L5 深度</span>
             </div>
         </div>
 
@@ -619,7 +576,6 @@
 
     <script>
         // 状态
-        let currentPlatform = 'xiaohongshu';
         let photos = [];
         let results = [];
 
@@ -806,7 +762,7 @@ async function uploadVideo(file) {
             document.getElementById('analyzeBtn').disabled = true;
 
             try {
-                const response = await fetch(`/api/analyze?platform=${currentPlatform}`, {
+                const response = await fetch(`/api/analyze`, {
                     method: 'POST',
                 });
                 const data = await response.json();
@@ -823,7 +779,7 @@ async function uploadVideo(file) {
         // 加载结果
         async function loadResults() {
             try {
-                const response = await fetch(`/api/results/${currentPlatform}`);
+                const response = await fetch(`/api/results/xiaohongshu`);
                 const data = await response.json();
                 results = data.results;
 
@@ -848,7 +804,7 @@ async function uploadVideo(file) {
 
                 card.innerHTML = `
                     <div class="rank">${index + 1}</div>
-                    <img src="/api/results/${currentPlatform}/${result.filename}" alt="${result.filename}">
+                    <img src="/api/results/xiaohongshu/${result.filename}" alt="${result.filename}">
                     <div class="info">
                         <div class="filename">${result.filename}</div>
                         <div class="score">
@@ -882,7 +838,7 @@ async function uploadVideo(file) {
             const modalImage = document.getElementById('modalImage');
             const modalAnalysis = document.getElementById('modalAnalysis');
 
-            modalImage.src = `/api/results/${currentPlatform}/${result.filename}`;
+            modalImage.src = `/api/results/xiaohongshu/${result.filename}`;
 
             modalAnalysis.innerHTML = `
                 <h3>📊 评分</h3>
@@ -903,18 +859,6 @@ async function uploadVideo(file) {
             if (e.target === document.getElementById('modal')) {
                 document.getElementById('modal').classList.remove('show');
             }
-        });
-
-        // 平台切换
-        document.querySelectorAll('.platform-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                document.querySelectorAll('.platform-btn').forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                currentPlatform = btn.dataset.platform;
-                if (results.length > 0) {
-                    loadResults();
-                }
-            });
         });
 
         // 清空照片
@@ -973,7 +917,7 @@ async function uploadVideo(file) {
         }
 
         // ── 进度条逻辑 ──
-        const LAYER_NAMES = { 0: '准备', 1: '客观指标', 2: '相似聚类', 3: '审美评分', 4: '人脸质量', 5: '深度分析' };
+        const LAYER_NAMES = { 0: '准备', 1: '客观指标', 2: '相似聚类', 3: '审美评分', 4: '人脸质量' };
 
         function showProgress(visible) {
             document.getElementById('progressContainer').classList.toggle('show', visible);
@@ -987,7 +931,7 @@ async function uploadVideo(file) {
         function updateProgress(layer, text, detail) {
             document.getElementById('layerText').textContent = text;
             document.getElementById('layerDetail').textContent = detail || '';
-            const pct = Math.min(100, Math.round((layer / 5) * 100));
+            const pct = Math.min(100, Math.round((layer / 4) * 100));
             document.getElementById('progressBar').style.width = pct + '%';
 
             document.querySelectorAll('#progressSteps .step').forEach(s => {
@@ -1005,7 +949,7 @@ async function uploadVideo(file) {
             if (layer === 0) {
                 updateProgress(0, '开始分析...', `共 ${data.total || '?'} 张照片`);
             } else {
-                updateProgress(layer, `Layer ${layer}/5: ${name}中...`, total);
+                updateProgress(layer, `Layer ${layer}/4: ${name}中...`, total);
             }
         }
 
@@ -1019,17 +963,17 @@ async function uploadVideo(file) {
             else if (data.faces !== undefined) detail = `检测到 ${data.faces} 张人脸`;
             else if (data.done !== undefined) detail = `完成 ${data.done} 张分析`;
 
-            updateProgress(layer, `Layer ${layer}/5: ${name} 完成`, detail);
+            updateProgress(layer, `Layer ${layer}/4: ${name} 完成`, detail);
         }
 
         function handleLayerProgress(data) {
-            const layer = data.layer || 5;
+            const layer = data.layer || 4;
             const current = data.current || 0;
             const total = data.total || 1;
-            const name = data.layer_name || '深度分析';
-            const pct = Math.round(((layer - 1 + current / total) / 5) * 100);
+            const name = data.layer_name || '分析';
+            const pct = Math.round(((layer - 1 + current / total) / 4) * 100);
             document.getElementById('progressBar').style.width = pct + '%';
-            document.getElementById('layerText').textContent = `Layer ${layer}/5: ${name} (${current}/${total})`;
+            document.getElementById('layerText').textContent = `Layer ${layer}/4: ${name} (${current}/${total})`;
             document.getElementById('layerDetail').textContent = data.message || '';
         }
 

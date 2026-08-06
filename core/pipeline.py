@@ -188,6 +188,7 @@ def run_pipeline(
     force: bool = False,
     rerun_layers: list[str] | None = None,
     incremental: bool = False,
+    skip_l1: bool = False,
 ) -> dict:
     """运行完整流水线（支持进度回调 + 断点续传 + 分层增量重跑 + 新增照片增量）
 
@@ -204,6 +205,8 @@ def run_pipeline(
             旧照片的 L1/L2/L4/TOPIQ/VLM 结果全部从 checkpoint 复用；
             L2 重新聚类（本地计算，快），仅对新增代表跑评分，最终全量排名。
             与 rerun_layers 互斥（同时传入时 incremental 优先）。
+        skip_l1: 为 True 时跳过 L1 淘汰（模糊/曝光不拦截），全部照片进入后续层
+            （仍计算 sharpness/pHash 供聚类与多样性使用）；强制全量重跑。
     """
     from core.layer1_objective import batch_analyze_with_phash
     from core.layer2_similarity import cluster_photos
@@ -246,6 +249,11 @@ def run_pipeline(
     rerun = _expand_rerun_layers(rerun_layers)
     if rerun:
         logger.info(f"[增量重跑] 指定: {sorted(rerun_layers or [])} → 实际: {sorted(rerun)}")
+
+    # 跳过 L1 淘汰：全部照片进入后续层，强制全量重跑
+    if skip_l1:
+        logger.info("[跳过L1] 模糊/曝光不拦截，全部照片进入后续层（强制全量重跑）")
+        rerun = _expand_rerun_layers(["l1"])
 
     # 新增照片增量：只处理不在 checkpoint 中的照片，旧照片结果全部复用
     incremental_new: list[Path] = []
@@ -336,11 +344,17 @@ def run_pipeline(
         try:
             # 逐张流水：分析完即算 pHash（不等整批），哈希供 L2/融合复用
             l1_results, phash_map = batch_analyze_with_phash(photos)
-            kept = [r for r in l1_results if not r.rejected]
-            rejected = [r for r in l1_results if r.rejected]
-            logger.info(f"[L1] 保留: {len(kept)}, 淘汰: {len(rejected)}")
-            for r in rejected:
-                logger.debug(f"  淘汰: {r.filename} ({r.reject_reason})")
+            if skip_l1:
+                # 跳过 L1 淘汰：全部照片保留（含模糊/曝光），sharpness 仍供聚类与多样性使用
+                kept = list(l1_results)
+                rejected = []
+                logger.info(f"[L1] 跳过淘汰: 全部 {len(kept)} 张保留")
+            else:
+                kept = [r for r in l1_results if not r.rejected]
+                rejected = [r for r in l1_results if r.rejected]
+                logger.info(f"[L1] 保留: {len(kept)}, 淘汰: {len(rejected)}")
+                for r in rejected:
+                    logger.debug(f"  淘汰: {r.filename} ({r.reject_reason})")
         except Exception as e:
             logger.error(f"[L1] 失败，跳过: {e}")
             kept = [Layer1Result(path=str(p), filename=p.name) for p in photos]
@@ -435,7 +449,7 @@ def run_pipeline(
                 if not api_key:
                     return
                 fsum = to_face_prompt_summary(r)
-                hflag = r.main_face_blink or (r.has_face and r.face_clarity < 0.25)
+                hflag = r.main_face_blink or (r.has_face and r.face_ratio > 0.10 and r.face_clarity < 0.10)
                 vlm_tasks.append((
                     r.path,
                     vlm_pool.submit(_run_dimension_analysis, r.path, face_summary=fsum),
@@ -510,8 +524,11 @@ def run_pipeline(
             face_scores[r.path] = 0.0
     # 人像硬伤标记：主脸闭眼或主脸明显模糊（对应 prompt 硬伤预检第 9 条）
     # 作为 VLM 综合审美 6 分上限的程序化钳制依据（不依赖 LLM 自觉）
+    # 收紧条件：仅当人脸占比 >10%（主体人像）且清晰度 <0.10（真糊）才判硬伤，
+    # 避免远景路人/正常拍摄的人像（人脸小、clarity 天然偏低）被误钳制到 6 分
+    # （实测 0.25 阈值致 53 张含人照片几乎全部触发钳制，VLM 好分被归一化压至 ~2.6）
     face_hard_flags = {
-        r.path: r.main_face_blink or (r.has_face and r.face_clarity < 0.25)
+        r.path: r.main_face_blink or (r.has_face and r.face_ratio > 0.10 and r.face_clarity < 0.10)
         for r in face_results
     }
 
@@ -579,7 +596,7 @@ def run_pipeline(
                                     _run_dimension_analysis, r.path,
                                     face_summary=to_face_prompt_summary(fr),
                                 ),
-                                fr.main_face_blink or (fr.has_face and fr.face_clarity < 0.25),
+                                fr.main_face_blink or (fr.has_face and fr.face_ratio > 0.10 and fr.face_clarity < 0.10),
                             ))
                 from core.layer3_aesthetic import (
                     _apply_dims_to_result,
@@ -923,7 +940,7 @@ def run_video_ranking(
     face_scores = {r.path: r.overall_face_score for r in face_results}
     face_summaries = {r.path: to_face_prompt_summary(r) for r in face_results}
     face_hard_flags = {
-        r.path: r.main_face_blink or (r.has_face and r.face_clarity < 0.25)
+        r.path: r.main_face_blink or (r.has_face and r.face_ratio > 0.10 and r.face_clarity < 0.10)
         for r in face_results
     }
     try:

@@ -242,10 +242,11 @@ def to_face_prompt_summary(r: Layer4Result) -> str:
 
     n = r.face_count
 
-    # 主脸清晰度定性
+    # 主脸清晰度定性（阈值与 pipeline 人像硬伤钳制条件对齐：clarity<0.10 才判"明显模糊"，
+    # 避免 0.10~0.25 区间正常拍摄的人像被 prompt 诱导为"明显模糊"，进而触发 VLM 硬伤自报钳制）
     if r.face_clarity >= 0.5:
         clarity = "清晰"
-    elif r.face_clarity >= 0.25:
+    elif r.face_clarity >= 0.10:
         clarity = "轻微模糊"
     else:
         clarity = "明显模糊"

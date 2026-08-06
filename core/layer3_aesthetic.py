@@ -233,10 +233,15 @@ def score_topiq(
 
 
 def _is_hard_flaw(result: Layer3Result, face_hard_flags: dict[str, bool] | None = None) -> bool:
-    """人像硬伤判定：L4 客观数据（主信号）或 VLM 自报闭眼/人脸模糊（辅助信号）"""
+    """人像硬伤判定：L4 客观数据（主信号）或 VLM 自报闭眼（辅助信号）
+
+    注意：VLM 自报"人脸模糊"不可作为钳制依据——L4 prompt 注入的
+    人脸清晰度文案会诱导 VLM 复述该硬伤（实测 53 张含人照片 52 张自报，
+    连 VLM 明言"非硬伤"的山羊照片都误报）；人脸模糊只由 L4 客观阈值把关。
+    """
     if face_hard_flags and face_hard_flags.get(result.path):
         return True
-    return any(("闭眼" in f) or ("人脸模糊" in f) for f in result.hard_flaws)
+    return any("闭眼" in f for f in result.hard_flaws)
 
 
 def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: bool = False) -> None:
@@ -252,8 +257,10 @@ def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: bool = Fa
         result.hard_flaws = list(dims["hard_flaws"])
     if dims.get("overall_aesthetic_score", 0) > 0:
         score = round(dims["overall_aesthetic_score"], 4)
-        # 钳制信号：L4 外部硬伤（hard_flag）或 VLM 自报闭眼/人脸模糊
-        vlm_hard = any(("闭眼" in f) or ("人脸模糊" in f) for f in dims.get("hard_flaws", []))
+        # 钳制信号：L4 外部硬伤（hard_flag）或 VLM 自报闭眼
+        # （VLM 自报"人脸模糊"不可靠：L4 prompt 注入的清晰度文案会诱导其复述，
+        #   实测山羊照片 VLM 明言"非硬伤"仍误报；人脸模糊交由 L4 客观阈值把关）
+        vlm_hard = any("闭眼" in f for f in dims.get("hard_flaws", []))
         if hard_flag or vlm_hard:
             score = min(score, 6.0)
             reason = dims.get("reason", "")

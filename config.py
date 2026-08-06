@@ -56,7 +56,11 @@ PLATFORMS = {
 }
 
 # Layer 1: 客观指标阈值
-LAPLACIAN_THRESHOLD = 100
+# 清晰度阈值：实测 100 附近无天然分界（95~105 连续分布 29 张），
+# sharpness 单指标在灰色地带区分不了好坏（同区间 VLM 0.1~9.4 并存），
+# 且低纹理场景（天空/水面）天然偏低，100 一刀切会误杀好图。
+# 降到 70：只拦截明显糊片（0-70 共 151 张），70-100 灰色地带交给后续层判断。
+LAPLACIAN_THRESHOLD = 70
 OVEREXPOSURE_THRESHOLD = 240
 UNDEREXPOSURE_THRESHOLD = 15
 # 淘汰比例阈值（超过亮度阈值的像素占比）
@@ -68,7 +72,10 @@ EXPOSURE_BAND = (70, 180)
 
 # Layer 2: 相似聚类（汉明距离，对应 config 的语义阈值）
 SIMILARITY_THRESHOLD = 0.85  # 余弦相似度（备用，当前未被任何模块引用）
-HAMMING_THRESHOLD = 20       # 感知哈希汉明距离（layer2_similarity.py 使用）
+# 感知哈希汉明距离（layer2_similarity.py 使用）
+# 实测 20 过宽导致跨日期/跨场景照片雪崩合并（409 张→30 组、最大组 377）；
+# 16 在悬崖前（16: 最大组 4，18: 最大组 186），配合照片榜同日期约束根治误合并
+HAMMING_THRESHOLD = 16
 
 # Layer 3/5 共用
 TOP_K_PER_CATEGORY = 5

@@ -8,6 +8,7 @@ from core.layer2_similarity import (
     _UnionFind,
     cluster_photos,
     compute_phash,
+    photo_date_key,
 )
 
 # ---------------------------------------------------------------------------
@@ -166,3 +167,51 @@ class TestClusterPhotos:
         clusters = cluster_photos([str(p)], {str(p): 50.0}, threshold=10)
         assert len(clusters) == 1
         assert clusters[0].member_count == 1
+
+
+class TestPhotoDateKey:
+    """文件名拍摄日期提取（同日期约束的基础）"""
+
+    def test_standard_photo_name(self):
+        assert photo_date_key("uploads/MVIMG_20260707_064715.jpg") == "20260707"
+
+    def test_heic_photo_name(self):
+        assert photo_date_key("uploads/IMG_20260713_105006.HEIC") == "20260713"
+
+    def test_video_frame_no_date(self):
+        """视频帧文件名无日期 → 返回 None（不参与同日期约束）"""
+        assert photo_date_key("uploads/video_frames/v01_ab12cd_t10.5.jpg") is None
+
+    def test_missing_date_returns_none(self):
+        assert photo_date_key("some/random_name.png") is None
+
+
+class TestClusterPhotosSameDate:
+    """同日期约束：跨日期 pHash 相近的照片不应合并"""
+
+    def test_cross_date_not_merged_when_same_date(self, tmp_path: Path):
+        """同一张图复制到不同日期文件名，same_date=True 时不应合并"""
+        # 两张内容完全相同的图（pHash 距离 0），但文件名日期不同
+        p1 = _make_gradient_image(tmp_path / "MVIMG_20260707_100000.jpg")
+        p2 = _make_gradient_image(tmp_path / "MVIMG_20260708_100000.jpg")
+        paths = [str(p1), str(p2)]
+        sharpness = {p: 100.0 for p in paths}
+
+        # 无约束：完全相同必然合并
+        clusters_loose = cluster_photos(paths, sharpness, threshold=10, same_date=False)
+        assert len(clusters_loose) == 1
+
+        # 同日期约束：跨日期不合并
+        clusters_strict = cluster_photos(paths, sharpness, threshold=10, same_date=True)
+        assert len(clusters_strict) == 2
+
+    def test_same_date_still_merged(self, tmp_path: Path):
+        """同日期内完全相同照片仍应合并（连拍去重不受影响）"""
+        p1 = _make_gradient_image(tmp_path / "MVIMG_20260707_100000.jpg")
+        p2 = _make_gradient_image(tmp_path / "MVIMG_20260707_100002.jpg")
+        paths = [str(p1), str(p2)]
+        sharpness = {p: 100.0 for p in paths}
+
+        clusters = cluster_photos(paths, sharpness, threshold=10, same_date=True)
+        assert len(clusters) == 1
+        assert clusters[0].member_count == 2

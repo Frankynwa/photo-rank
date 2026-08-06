@@ -146,6 +146,25 @@ def _remove_checkpoint(output_dir: Path) -> None:
         logger.info("[Checkpoint] 已删除")
 
 
+def _expand_rerun_layers(rerun_layers: list[str] | None) -> set[str]:
+    """增量重跑依赖传播：上游层重跑 → 依赖它的下游层必须连带重跑
+
+    依赖链：l1(客观) → l2(聚类) → {l4(人脸), topiq, vlm}；l4(人脸) → vlm（VLM prompt 注入人脸信息）。
+    - 重跑 l1 → l2/l4/topiq/vlm 全部连带（聚类与评分全部基于新客观筛选）
+    - 重跑 l2 → l4/topiq/vlm 连带（代表帧集合变化）
+    - 重跑 l4 → vlm 连带（人脸信息变化，VLM 需重新注入）
+    - topiq 与 vlm 相互独立：各自可单独重跑
+    """
+    rerun = set(rerun_layers or [])
+    if "l1" in rerun:
+        rerun |= {"l2", "l4", "topiq", "vlm"}
+    if "l2" in rerun:
+        rerun |= {"l4", "topiq", "vlm"}
+    if "l4" in rerun:
+        rerun |= {"vlm"}
+    return rerun
+
+
 def _save_layer_checkpoint(output_dir: Path, layer: int, extra: dict) -> None:
     """保存指定层的 checkpoint，自动合并前面各层的数据
 
@@ -167,14 +186,19 @@ def run_pipeline(
     platform: str = "xiaohongshu",
     progress_callback=None,
     force: bool = False,
+    rerun_layers: list[str] | None = None,
 ) -> dict:
-    """运行完整流水线（支持进度回调 + 断点续传）
+    """运行完整流水线（支持进度回调 + 断点续传 + 分层增量重跑）
 
     Args:
         photos_dir: 照片目录
         platform: 目标平台
         progress_callback: 进度回调函数
         force: 为 True 时忽略 checkpoint 从头开始
+        rerun_layers: 只重跑指定层（其余从 checkpoint 恢复），如 ["topiq"]。
+            可选: l1 / l2 / l4 / topiq / vlm；有依赖的层自动连带重跑
+            （重跑 l1 → 全量；重跑 l2 → l4/topiq/vlm；重跑 l4 → vlm）。
+            前提：checkpoint 已包含其余层的中间结果。
     """
     from core.layer1_objective import batch_analyze_with_phash
     from core.layer2_similarity import cluster_photos
@@ -212,6 +236,11 @@ def run_pipeline(
     # 旧版 v1 checkpoint（completed_layer 为层号，且 L3 的 VLM 评分未注入人脸信息）：
     # 仅复用 L1/L2 数据，L4/L3 强制重跑。
     checkpoint = None if force else _load_checkpoint(output_dir)
+
+    # 增量重跑依赖传播：上游层重跑 → 依赖它的下游层必须连带重跑
+    rerun = _expand_rerun_layers(rerun_layers)
+    if rerun:
+        logger.info(f"[增量重跑] 指定: {sorted(rerun_layers or [])} → 实际: {sorted(rerun)}")
     if checkpoint:
         if checkpoint.get("version") == 2:
             logger.info(
@@ -241,13 +270,13 @@ def run_pipeline(
     skipped_layers: list[str] = []
 
     # ── Layer 1: 客观指标 ──
-    if checkpoint and checkpoint["completed_layer"] >= 1:
+    if checkpoint and checkpoint["completed_layer"] >= 1 and "l1" not in rerun:
         kept = [Layer1Result(**r) for r in checkpoint.get("kept", [])]
         rejected = [Layer1Result(**r) for r in checkpoint.get("rejected", [])]
         skipped_layers = checkpoint.get("skipped_layers", [])
         # 重建流水阶段算好的 pHash（序列化为十六进制字符串存储）
         phash_map = {
-            p: (imagehash.ImageHash(v) if isinstance(v, str) else v)
+            p: (imagehash.hex_to_hash(v) if isinstance(v, str) else v)
             for p, v in checkpoint.get("phash_map", {}).items()
         }
         logger.info(f"[L1] 从 checkpoint 恢复: 保留 {len(kept)}, 淘汰 {len(rejected)}")
@@ -279,7 +308,7 @@ def run_pipeline(
     l1_scores = {r.path: r.overall for r in kept}
 
     # ── Layer 2: 相似聚类 ──
-    if checkpoint and checkpoint["completed_layer"] >= 2:
+    if checkpoint and checkpoint["completed_layer"] >= 2 and "l2" not in rerun:
         clusters = [SimilarityCluster(**c) for c in checkpoint.get("clusters", [])]
         representatives = [r for c in clusters for r in (c.representatives or [c.representative])]
         merged = sum(c.member_count - 1 for c in clusters if c.member_count > 1)
@@ -290,7 +319,11 @@ def run_pipeline(
         try:
             sharpness_scores = {r.path: r.sharpness for r in kept}
             # 复用 L1 流水阶段算好的 pHash，跳过重复计算
-            clusters = cluster_photos([r.path for r in kept], sharpness_scores, precomputed_hashes=phash_map)
+            # 同日期约束：跨日期 pHash 相近的（海景/天空/建筑同质化）不视为连拍，防误合并
+            clusters = cluster_photos(
+                [r.path for r in kept], sharpness_scores,
+                precomputed_hashes=phash_map, same_date=True,
+            )
             representatives = [r for c in clusters for r in (c.representatives or [c.representative])]
             merged = sum(c.member_count - 1 for c in clusters if c.member_count > 1)
             logger.info(f"[L2] 聚类: {len(clusters)} 组, 合并: {merged}")
@@ -308,16 +341,26 @@ def run_pipeline(
     # ── Layer 4 + Layer 3-TOPIQ：层间并发 + VLM 图片级流水 ──
     # L4 分析完一张立即发起该张的 VLM API 调用（与 TOPIQ 推理并行），
     # 消除"等全部 L4 完成才启动 VLM"的空等（VLM 是网络 IO 最慢环节，提前启动收益最大）
+    # 增量重跑：L4 / TOPIQ 可从 checkpoint 独立恢复（rerun_layers 指定重跑部分）
     vlm_tasks: list[tuple[str, object, bool]] = []  # (path, VLM future, hard_flag)
     api_key = os.environ.get("QWEN_API_KEY", "")
-    if checkpoint and checkpoint["completed_layer"] >= 3:
-        face_results = [Layer4Result(**r) for r in checkpoint.get("face_results", [])]
-        aes_topiq_results = []  # L3 将从 checkpoint 恢复或重跑 TOPIQ
+    l4_ckpt_ok = bool(checkpoint and checkpoint["completed_layer"] >= 3 and checkpoint.get("face_results"))
+    topiq_ckpt_ok = bool(checkpoint and checkpoint["completed_layer"] >= 4 and checkpoint.get("aes_results"))
+    rerun_l4 = "l4" in rerun
+    rerun_topiq = "topiq" in rerun
+    need_l4 = not (l4_ckpt_ok and not rerun_l4)
+    need_topiq = not (topiq_ckpt_ok and not rerun_topiq)
+
+    if not need_l4 and not need_topiq:
+        face_results = [Layer4Result(**r) for r in checkpoint["face_results"]]
+        aes_topiq_results = [Layer3Result(**r) for r in checkpoint["aes_results"]]
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
         logger.info(f"[L4] 从 checkpoint 恢复: {len(face_results)} 张")
+        logger.info(f"[L3-TOPIQ] 从 checkpoint 恢复: {len(aes_topiq_results)} 张")
     else:
         _emit(progress_callback, "layer_start", layer=3, layer_name="人脸质量")
         from concurrent.futures import ThreadPoolExecutor
+
         from core.layer3_aesthetic import _VLM_CONCURRENCY, _run_dimension_analysis
         vlm_pool = None
         try:
@@ -337,28 +380,36 @@ def run_pipeline(
                 ))
 
             with ThreadPoolExecutor(max_workers=2) as pool:
-                f_face = pool.submit(analyze_faces, representatives, on_photo_done=_on_face_done)
-                f_topiq = pool.submit(score_topiq, representatives, "auto")
-                try:
-                    face_results = f_face.result()
-                    face_count = sum(1 for r in face_results if r.has_face)
-                    blink_count = sum(1 for r in face_results if r.blink_detected)
-                    logger.info(f"[L4] 人脸: {face_count}, 闭眼: {blink_count}")
-                except Exception as e:
-                    logger.error(f"[L4] 失败，跳过: {e}")
-                    face_results = []
-                    skipped_layers.append("Layer 4")
-                try:
-                    aes_topiq_results = f_topiq.result()
-                    logger.info(f"[L3-TOPIQ] 完成: {len(aes_topiq_results)} 张")
-                except Exception as e:
-                    logger.error(f"[L3-TOPIQ] 失败，跳过: {e}")
-                    aes_topiq_results = []
-                    skipped_layers.append("Layer 3")
+                f_face = pool.submit(analyze_faces, representatives, on_photo_done=_on_face_done) if need_l4 else None
+                f_topiq = pool.submit(score_topiq, representatives, "auto") if need_topiq else None
+                if f_face is not None:
+                    try:
+                        face_results = f_face.result()
+                        face_count = sum(1 for r in face_results if r.has_face)
+                        blink_count = sum(1 for r in face_results if r.blink_detected)
+                        logger.info(f"[L4] 人脸: {face_count}, 闭眼: {blink_count}")
+                    except Exception as e:
+                        logger.error(f"[L4] 失败，跳过: {e}")
+                        face_results = []
+                        skipped_layers.append("Layer 4")
+                else:
+                    face_results = [Layer4Result(**r) for r in checkpoint["face_results"]]
+                    logger.info(f"[L4] 从 checkpoint 恢复: {len(face_results)} 张")
+                if f_topiq is not None:
+                    try:
+                        aes_topiq_results = f_topiq.result()
+                        logger.info(f"[L3-TOPIQ] 完成: {len(aes_topiq_results)} 张")
+                    except Exception as e:
+                        logger.error(f"[L3-TOPIQ] 失败，跳过: {e}")
+                        aes_topiq_results = []
+                        skipped_layers.append("Layer 3")
+                else:
+                    aes_topiq_results = [Layer3Result(**r) for r in checkpoint["aes_results"]]
+                    logger.info(f"[L3-TOPIQ] 从 checkpoint 恢复: {len(aes_topiq_results)} 张")
         except Exception as e:
             logger.error(f"[L4/L3-TOPIQ] 并发启动失败: {e}")
-            face_results = []
-            aes_topiq_results = []
+            face_results = [] if need_l4 else [Layer4Result(**r) for r in checkpoint["face_results"]]
+            aes_topiq_results = [] if need_topiq else [Layer3Result(**r) for r in checkpoint["aes_results"]]
         finally:
             if vlm_pool is not None:
                 vlm_pool.shutdown(wait=False)  # 已提交任务照常完成，L3 阶段 await
@@ -382,8 +433,34 @@ def run_pipeline(
     }
 
     # ── Layer 3: 审美评分（TOPIQ 已与 L4 并发完成，VLM API 已在 L4 回调阶段逐张发起）──
-    if checkpoint and checkpoint["completed_layer"] >= 4:
-        aes_results = [Layer3Result(**r) for r in checkpoint.get("aes_results", [])]
+    rerun_vlm = "vlm" in rerun
+    aes_ckpt_ok = bool(checkpoint and checkpoint["completed_layer"] >= 4 and checkpoint.get("aes_results"))
+    need_vlm = not (aes_ckpt_ok and not rerun_vlm)
+
+    if not need_vlm and need_topiq:
+        # TOPIQ-only 增量重跑：新 TOPIQ 分覆盖到 checkpoint 结果上，VLM 分直接复用
+        aes_results = [Layer3Result(**r) for r in checkpoint["aes_results"]]
+        new_topiq_by_path = {r.path: r for r in aes_topiq_results if not r.error}
+        replaced = 0
+        for r in aes_results:
+            nr = new_topiq_by_path.get(r.path)
+            if nr is None:
+                continue  # 新 TOPIQ 失败/缺失 → 保留 checkpoint 旧分
+            r.aesthetic_score = nr.aesthetic_score
+            r.technical_score = nr.technical_score
+            r.overall_score = nr.overall_score
+            r.final_score = nr.final_score
+            r.device = nr.device
+            replaced += 1
+        aes_results.sort(key=lambda x: x.overall_score, reverse=True)
+        skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
+        logger.info(f"[L3] TOPIQ 重跑完成（替换 {replaced}/{len(aes_results)} 张），VLM 分复用 checkpoint")
+        _save_layer_checkpoint(output_dir, 4, {
+            "aes_results": [r.model_dump() for r in aes_results],
+            "skipped_layers": skipped_layers,
+        })
+    elif not need_vlm:
+        aes_results = [Layer3Result(**r) for r in checkpoint["aes_results"]]
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
         logger.info(f"[L3] 从 checkpoint 恢复: {len(aes_results)} 张")
     else:
@@ -396,6 +473,7 @@ def run_pipeline(
                 if not vlm_tasks:
                     # 续传/降级路径：L4 从 checkpoint 恢复或 L4 失败，VLM 未提前发起 → 补齐逐张发起
                     from concurrent.futures import ThreadPoolExecutor as _TPE
+
                     from core.layer3_aesthetic import _VLM_CONCURRENCY, _run_dimension_analysis
                     face_by_path = {r.path: r for r in face_results}
                     with _TPE(max_workers=_VLM_CONCURRENCY) as vp:

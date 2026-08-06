@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,16 @@ logger = logging.getLogger(__name__)
 # BK-Tree 小数据集 fallback 阈值
 # 当照片数 < 此值时，Python 级别的暴力搜索因更低的常数开销反而更快
 _BK_TREE_FALLBACK_SIZE = 500
+
+# 文件名中的拍摄日期模式：MVIMG_20260707_064715.jpg → 20260707
+# 仅匹配照片命名（视频帧无日期，不受影响）
+_PHOTO_DATE_RE = re.compile(r"(20\d{6})_")
+
+
+def photo_date_key(image_path: str | Path) -> str | None:
+    """从文件名提取拍摄日期（YYYYMMDD）；无法解析返回 None（不参与同日期约束）"""
+    m = _PHOTO_DATE_RE.search(Path(image_path).name)
+    return m.group(1) if m else None
 
 
 @dataclass
@@ -85,11 +96,19 @@ def _brute_force_pairs(
     hashes: dict[str, imagehash.ImageHash],
     threshold: int,
     uf: _UnionFind,
+    same_date: bool = False,
+    date_keys: dict[str, str | None] | None = None,
 ) -> None:
-    """暴力 O(n²) 两两比较（小数据集 fallback）"""
+    """暴力 O(n²) 两两比较（小数据集 fallback）
+
+    same_date=True 时仅同日期照片配对（照片榜防跨日期误合并）；
+    视频榜帧无日期（date_keys 全 None）不受影响。
+    """
     m = len(valid)
     for i in range(m):
         for j in range(i + 1, m):
+            if same_date and date_keys and date_keys.get(valid[i]) != date_keys.get(valid[j]):
+                continue  # 跨日期不视为同场景连拍
             if hashes[valid[i]] - hashes[valid[j]] <= threshold:
                 uf.union(i, j)
 
@@ -99,6 +118,8 @@ def _bktree_pairs(
     hashes: dict[str, imagehash.ImageHash],
     threshold: int,
     uf: _UnionFind,
+    same_date: bool = False,
+    date_keys: dict[str, str | None] | None = None,
 ) -> None:
     """使用增量 BK-Tree 进行范围查询，避免 O(n²) 全量比较
 
@@ -116,6 +137,8 @@ def _bktree_pairs(
         # 在已插入的 i 张照片中查找距离 ≤ threshold 的邻居
         for nh in tree.query(h, threshold):
             for j in hash_to_indices.get(nh, []):
+                if same_date and date_keys and date_keys.get(valid[j]) != date_keys.get(valid[i]):
+                    continue  # 跨日期不视为同场景连拍
                 uf.union(j, i)
         # 查询完毕后再插入，避免自匹配
         tree.insert(h)
@@ -163,13 +186,17 @@ def cluster_photos(
     sharpness_scores: dict[str, float],
     threshold: int = HAMMING_THRESHOLD,
     precomputed_hashes: dict[str, imagehash.ImageHash] | None = None,
+    same_date: bool = False,
 ) -> list[SimilarityClusterModel]:
     """将相似照片聚类（Union-Find + 感知哈希）
 
     precomputed_hashes: path -> ImageHash（来自 L1 流水阶段），传入后跳过
     哈希计算阶段直接聚类；为 None 或缺失时回退到内部串行计算。
+    same_date: 仅同日期照片可合并（照片榜开启，防跨日期不同场景误合并）；
+               视频榜帧无日期信息，保持 False 不启用。
     """
     paths = [str(p) for p in image_paths]
+    date_keys = {p: photo_date_key(p) for p in paths} if same_date else None
 
     # 计算哈希（优先复用流水阶段结果，缺失的照片单独计入 failed）
     hashes = {}
@@ -196,11 +223,11 @@ def cluster_photos(
 
     if m < _BK_TREE_FALLBACK_SIZE:
         # 小数据集：暴力搜索开销更低
-        _brute_force_pairs(valid, hashes, threshold, uf)
+        _brute_force_pairs(valid, hashes, threshold, uf, same_date=same_date, date_keys=date_keys)
     else:
         # 大数据集：BK-Tree 范围查询 O(n log n)
         logger.info(f"照片数量 {m} ≥ {_BK_TREE_FALLBACK_SIZE}，启用 BK-Tree 索引")
-        _bktree_pairs(valid, hashes, threshold, uf)
+        _bktree_pairs(valid, hashes, threshold, uf, same_date=same_date, date_keys=date_keys)
 
     # 分组
     groups = {}

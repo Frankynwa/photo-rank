@@ -5,11 +5,9 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
-import pytest
 
 from core.models import Layer3Result
 from core.pipeline import _allocate_quotas, run_video_ranking
-
 
 # ---------------------------------------------------------------------------
 # 名额分配（时长比例）测试

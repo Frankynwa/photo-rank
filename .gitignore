@@ -39,3 +39,6 @@ logs/
 # Environment
 .env
 *.env.local
+
+# CI 验证环境
+.ci_venv/

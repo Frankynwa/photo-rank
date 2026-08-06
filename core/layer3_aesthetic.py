@@ -473,6 +473,7 @@ async def _analyze_dimensions(
     - 指数退避重试 + 分数钳制 [1,10]
     """
     import httpx
+
     from core.image_cache import get_cached_path
 
     img = Image.open(get_cached_path(image_path)).convert("RGB")

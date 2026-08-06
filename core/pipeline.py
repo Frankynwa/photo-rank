@@ -187,8 +187,9 @@ def run_pipeline(
     progress_callback=None,
     force: bool = False,
     rerun_layers: list[str] | None = None,
+    incremental: bool = False,
 ) -> dict:
-    """运行完整流水线（支持进度回调 + 断点续传 + 分层增量重跑）
+    """运行完整流水线（支持进度回调 + 断点续传 + 分层增量重跑 + 新增照片增量）
 
     Args:
         photos_dir: 照片目录
@@ -199,6 +200,10 @@ def run_pipeline(
             可选: l1 / l2 / l4 / topiq / vlm；有依赖的层自动连带重跑
             （重跑 l1 → 全量；重跑 l2 → l4/topiq/vlm；重跑 l4 → vlm）。
             前提：checkpoint 已包含其余层的中间结果。
+        incremental: 为 True 时只处理新增照片（不在 checkpoint 中的），
+            旧照片的 L1/L2/L4/TOPIQ/VLM 结果全部从 checkpoint 复用；
+            L2 重新聚类（本地计算，快），仅对新增代表跑评分，最终全量排名。
+            与 rerun_layers 互斥（同时传入时 incremental 优先）。
     """
     from core.layer1_objective import batch_analyze_with_phash
     from core.layer2_similarity import cluster_photos
@@ -241,6 +246,29 @@ def run_pipeline(
     rerun = _expand_rerun_layers(rerun_layers)
     if rerun:
         logger.info(f"[增量重跑] 指定: {sorted(rerun_layers or [])} → 实际: {sorted(rerun)}")
+
+    # 新增照片增量：只处理不在 checkpoint 中的照片，旧照片结果全部复用
+    incremental_new: list[Path] = []
+    if incremental:
+        if rerun:
+            logger.warning("[增量] 与 rerun_layers 同时传入，incremental 优先，忽略 rerun_layers")
+            rerun = set()
+        if checkpoint and checkpoint.get("version") == 2:
+            known = {r["path"] for r in checkpoint.get("kept", [])} | {
+                r["path"] for r in checkpoint.get("rejected", [])
+            }
+            incremental_new = [p for p in photos if str(p) not in known]
+            if not incremental_new:
+                logger.info("[增量] 无新增照片，全部复用 checkpoint 结果")
+                incremental = False  # 退化：走正常 checkpoint 恢复路径
+            else:
+                logger.info(
+                    f"[增量] 新增 {len(incremental_new)} 张照片，"
+                    f"其余 {len(photos) - len(incremental_new)} 张复用 checkpoint"
+                )
+        else:
+            logger.warning("[增量] 无可用 checkpoint（v2），退化为全量重跑")
+            incremental = False
     if checkpoint:
         if checkpoint.get("version") == 2:
             logger.info(
@@ -279,7 +307,30 @@ def run_pipeline(
             p: (imagehash.hex_to_hash(v) if isinstance(v, str) else v)
             for p, v in checkpoint.get("phash_map", {}).items()
         }
-        logger.info(f"[L1] 从 checkpoint 恢复: 保留 {len(kept)}, 淘汰 {len(rejected)}")
+        if incremental:
+            # 增量：只对新增照片跑 L1，旧照片结果从 checkpoint 复用
+            if incremental_new:
+                new_l1, new_phash = batch_analyze_with_phash(incremental_new)
+                new_kept = [r for r in new_l1 if not r.rejected]
+                new_rej = [r for r in new_l1 if r.rejected]
+                kept += new_kept
+                rejected += new_rej
+                phash_map.update(new_phash)
+                logger.info(
+                    f"[L1] 增量: 恢复 {len(kept) - len(new_kept)} 保留/"
+                    f"{len(rejected) - len(new_rej)} 淘汰 + 新增 {len(new_kept)} 保留/"
+                    f"{len(new_rej)} 淘汰"
+                )
+                _save_layer_checkpoint(output_dir, 1, {
+                    "kept": [r.model_dump() for r in kept],
+                    "rejected": [r.model_dump() for r in rejected],
+                    "phash_map": {p: str(h) for p, h in phash_map.items()},
+                    "skipped_layers": skipped_layers,
+                })
+            else:
+                logger.info(f"[L1] 增量（无新增）: 保留 {len(kept)}, 淘汰 {len(rejected)}")
+        else:
+            logger.info(f"[L1] 从 checkpoint 恢复: 保留 {len(kept)}, 淘汰 {len(rejected)}")
     else:
         _emit(progress_callback, "layer_start", layer=1, layer_name="客观指标")
         try:
@@ -308,7 +359,7 @@ def run_pipeline(
     l1_scores = {r.path: r.overall for r in kept}
 
     # ── Layer 2: 相似聚类 ──
-    if checkpoint and checkpoint["completed_layer"] >= 2 and "l2" not in rerun:
+    if checkpoint and checkpoint["completed_layer"] >= 2 and "l2" not in rerun and not incremental:
         clusters = [SimilarityCluster(**c) for c in checkpoint.get("clusters", [])]
         representatives = [r for c in clusters for r in (c.representatives or [c.representative])]
         merged = sum(c.member_count - 1 for c in clusters if c.member_count > 1)
@@ -351,6 +402,18 @@ def run_pipeline(
     need_l4 = not (l4_ckpt_ok and not rerun_l4)
     need_topiq = not (topiq_ckpt_ok and not rerun_topiq)
 
+    # 增量模式：只对新增代表评分（旧代表从 checkpoint 恢复）
+    scoring_targets: list[str] = representatives
+    if incremental:
+        old_face_paths = {r["path"] for r in checkpoint.get("face_results", [])}
+        scoring_targets = [p for p in representatives if p not in old_face_paths]
+        need_l4 = bool(scoring_targets)
+        need_topiq = bool(scoring_targets)
+        logger.info(
+            f"[增量] 代表 {len(representatives)} 张，需评分 {len(scoring_targets)} 张"
+            f"（其余从 checkpoint 复用）"
+        )
+
     if not need_l4 and not need_topiq:
         face_results = [Layer4Result(**r) for r in checkpoint["face_results"]]
         aes_topiq_results = [Layer3Result(**r) for r in checkpoint["aes_results"]]
@@ -380,8 +443,8 @@ def run_pipeline(
                 ))
 
             with ThreadPoolExecutor(max_workers=2) as pool:
-                f_face = pool.submit(analyze_faces, representatives, on_photo_done=_on_face_done) if need_l4 else None
-                f_topiq = pool.submit(score_topiq, representatives, "auto") if need_topiq else None
+                f_face = pool.submit(analyze_faces, scoring_targets, on_photo_done=_on_face_done) if need_l4 else None
+                f_topiq = pool.submit(score_topiq, scoring_targets, "auto") if need_topiq else None
                 if f_face is not None:
                     try:
                         face_results = f_face.result()
@@ -419,6 +482,26 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
+    # 增量模式：合并 checkpoint 中旧代表的评分 + 本轮新代表的评分
+    if incremental:
+        old_face = {r["path"]: Layer4Result(**r) for r in checkpoint.get("face_results", [])}
+        old_aes = {r["path"]: Layer3Result(**r) for r in checkpoint.get("aes_results", [])}
+        rep_set = set(representatives)
+        merged_face = [old_face[p] for p in representatives if p in old_face]
+        merged_face += [r for r in face_results if r.path in rep_set and r.path not in old_face]
+        face_results = merged_face
+        merged_aes = [old_aes[p] for p in representatives if p in old_aes]
+        merged_aes += [r for r in aes_topiq_results if r.path in rep_set and r.path not in old_aes]
+        aes_topiq_results = merged_aes
+        logger.info(
+            f"[增量] 合并评分: 人脸 {len(face_results)} 张（新评 {len(scoring_targets)} 张），"
+            f"TOPIQ {len(aes_topiq_results)} 张"
+        )
+        _save_layer_checkpoint(output_dir, 3, {
+            "face_results": [r.model_dump() for r in face_results],
+            "skipped_layers": skipped_layers,
+        })
+
     # 派生 L4 产物：融合分映射（VLM prompt 注入文案已在图片级流水回调中逐张生成）
     face_scores = {r.path: r.overall_face_score for r in face_results}
     # 降级兜底：多人环境场景（≥6 张脸且主脸占比 < 10%）判定人脸为环境元素，不参与加分
@@ -435,7 +518,11 @@ def run_pipeline(
     # ── Layer 3: 审美评分（TOPIQ 已与 L4 并发完成，VLM API 已在 L4 回调阶段逐张发起）──
     rerun_vlm = "vlm" in rerun
     aes_ckpt_ok = bool(checkpoint and checkpoint["completed_layer"] >= 4 and checkpoint.get("aes_results"))
-    need_vlm = not (aes_ckpt_ok and not rerun_vlm)
+    if incremental:
+        # 增量：有新代表才需要走 VLM 处理（旧代表沿用 checkpoint 分）
+        need_vlm = bool(scoring_targets)
+    else:
+        need_vlm = not (aes_ckpt_ok and not rerun_vlm)
 
     if not need_vlm and need_topiq:
         # TOPIQ-only 增量重跑：新 TOPIQ 分覆盖到 checkpoint 结果上，VLM 分直接复用
@@ -476,8 +563,13 @@ def run_pipeline(
 
                     from core.layer3_aesthetic import _VLM_CONCURRENCY, _run_dimension_analysis
                     face_by_path = {r.path: r for r in face_results}
+                    # 增量模式：兜底也只对新增代表发起（旧代表严禁重跑 VLM）
+                    vlm_scope = aes_topiq_results
+                    if incremental:
+                        new_rep_set = set(scoring_targets)
+                        vlm_scope = [r for r in aes_topiq_results if r.path in new_rep_set]
                     with _TPE(max_workers=_VLM_CONCURRENCY) as vp:
-                        for r in aes_topiq_results:
+                        for r in vlm_scope:
                             if r.error or r.path not in face_by_path:
                                 continue
                             fr = face_by_path[r.path]
@@ -506,7 +598,11 @@ def run_pipeline(
                         dims = {}
                     _apply_dims_to_result(r, dims, hard_flag=hflag)
                 # 与 apply_vlm_dimensions 一致的归一化 + 硬伤重新钳制
-                _normalize_vlm_batch(aes_topiq_results)
+                if incremental:
+                    # 增量：仅对新代表的 VLM 分做批次归一化（旧代表沿用 checkpoint 归一化值）
+                    _normalize_vlm_batch([r for r in aes_topiq_results if r.path in set(scoring_targets)])
+                else:
+                    _normalize_vlm_batch(aes_topiq_results)
                 for r in aes_topiq_results:
                     if r.vlm_overall_score > 6.0 and _is_hard_flaw(r, face_hard_flags):
                         r.vlm_overall_score = 6.0

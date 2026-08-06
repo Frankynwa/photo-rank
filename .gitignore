@@ -42,3 +42,6 @@ logs/
 
 # CI 验证环境
 .ci_venv/
+
+# Obsidian vault 配置（跨机同步避免 workspace 冲突）
+wiki/.obsidian/

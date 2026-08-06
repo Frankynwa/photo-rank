@@ -27,7 +27,7 @@ jobs:
         pip install pytest pytest-asyncio ruff
         # 跳过重量级依赖（pyiqa/mediapipe），测试已 mock
         pip install fastapi uvicorn httpx python-multipart PyYAML python-dotenv
-        pip install Pillow pillow-heif opencv-python numpy imagehash
+        pip install Pillow pillow-heif opencv-python-headless numpy imagehash
 
     - name: Run ruff
       run: ruff check .

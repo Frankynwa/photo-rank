@@ -468,7 +468,11 @@ class TestHardFlawsParsing:
         assert "hard_flaws" not in out
 
     def test_vlm_hard_flaw_triggers_clamp(self):
-        """VLM 自报闭眼/人脸模糊也应触发钳制（辅助信号，即使 L4 未标记）"""
+        """VLM 自报闭眼应触发钳制（辅助信号，即使 L4 未标记）
+
+        注意：自报"人脸模糊"不再触发钳制（实测被 L4 prompt 注入文案诱导误报，
+        人脸模糊仅由 L4 客观阈值把关），见 test_face_blur_no_clamp。
+        """
         from core.layer3_aesthetic import _apply_dims_to_result
         r = Layer3Result(path="/a.jpg", filename="a.jpg")
         dims = {"composition_score": 8.0, "color_score": 7.5,
@@ -477,6 +481,27 @@ class TestHardFlawsParsing:
         _apply_dims_to_result(r, dims, hard_flag=False)  # L4 未标记
         assert r.vlm_overall_score == 6.0  # VLM 自报闭眼 → 钳制
         assert "闭眼" in r.hard_flaws
+
+    def test_face_blur_no_clamp(self):
+        """VLM 自报"人脸模糊"不再触发 6 分钳制（L4 客观数据已另行把关）"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5,
+                "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
+                "hard_flaws": ["人脸模糊"]}
+        _apply_dims_to_result(r, dims, hard_flag=False)
+        assert r.vlm_overall_score == 6.8  # 人脸模糊自报 → 不钳制，保留原分
+        assert "人脸模糊" in r.hard_flaws  # 仍记录硬伤（供维度分参考）
+
+    def test_l4_hard_flag_clamp(self):
+        """L4 客观硬伤（hard_flag=True）仍触发钳制，不依赖 VLM 自报"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5,
+                "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
+                "hard_flaws": []}
+        _apply_dims_to_result(r, dims, hard_flag=True)  # L4 客观判定硬伤
+        assert r.vlm_overall_score == 6.0
 
     def test_non_face_flaw_no_clamp(self):
         """非人像硬伤（如过曝）不应触发 6 分钳制"""

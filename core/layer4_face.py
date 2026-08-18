@@ -242,9 +242,17 @@ def to_face_prompt_summary(r: Layer4Result) -> str:
 
     n = r.face_count
 
-    # 主脸清晰度定性（阈值与 pipeline 人像硬伤钳制条件对齐：clarity<0.10 才判"明显模糊"，
-    # 避免 0.10~0.25 区间正常拍摄的人像被 prompt 诱导为"明显模糊"，进而触发 VLM 硬伤自报钳制）
-    if r.face_clarity >= 0.5:
+    # 主脸清晰度定性（分档尺度经实测校准：
+    # 整图 Laplacian 101（L1 判定清晰合格，阈值 70）的照片，人脸区域 clarity 仅 0.293；
+    # 旧阈值 0.5 致正常清晰人像被判"轻微模糊"，诱导 VLM 压分（实测 53 张含人照片 0 张≥0.5）。
+    # 新分档：≥0.15 清晰 / 0.10~0.15 轻微模糊（中性提示，VLM 自行裁断）/ <0.10 明显模糊。
+    # "明显模糊"档与 pipeline 硬伤钳制条件（clarity<0.10）对齐，避免文案与钳制语义错位。
+    # 环境人像（人脸占比<10%）：人脸小、Laplacian 方差天然偏低，clarity 低不代表"模糊"，
+    # 不输出负面定性，避免诱导 VLM 误把"人脸模糊"当成影响主体清晰度的因素
+    # （实测酒吧氛围照 face_ratio 3.8% 被标"明显模糊"，VLM 被误导压低构图/光影分并凑瑕疵理由）
+    if r.face_ratio < 0.10:
+        clarity = "人脸较小，不作清晰度评判"
+    elif r.face_clarity >= 0.15:
         clarity = "清晰"
     elif r.face_clarity >= 0.10:
         clarity = "轻微模糊"

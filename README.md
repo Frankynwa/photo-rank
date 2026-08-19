@@ -8,13 +8,14 @@
 
 ## ✨ 特性
 
-- **5 层本地模型流水线** — 客观指标 → 相似聚类 → 审美评分 → 人脸质量 → 深度分析，逐层筛选可验证
+- **4 层本地模型流水线** — 客观指标 → 相似聚类 → 审美评分 → 人脸质量，逐层筛选可验证
+- **精细化审美评分** — TOPIQ-IAA + VLM 多维度评分（构图/色彩/光影）多路融合，无脸照片权重重分配
+- **视频支持** — 流式抽帧 + 本地快筛，视频独立双榜单
 - **RTX 5070 CUDA 加速** — 审美评分 GPU 推理
 - **Web UI** — 拖拽上传、WebSocket 实时进度、详情查看
-- **平台适配** — 小红书/朋友圈/抖音独立评分
-- **深度分析** — Qwen-VL API 分类/构图/改进/情绪/文案
+- **增量模式** — 只处理新增照片，断点续跑
 - **安全可靠** — 路径遍历防护、文件类型校验、上传大小限制
-- **工程质量** — 44 个单元测试、Pydantic 数据模型、ruff 代码风格检查
+- **工程质量** — 172 个单元测试、Pydantic 数据模型、ruff 代码风格检查
 
 ## 🏗️ 架构
 
@@ -24,30 +25,29 @@
     ↓   淘汰模糊/过曝/欠曝
 36 张保留
     ↓ Layer 2: 相似聚类（pHash，CPU）
-    ↓   同类选最佳
+    ↓   每组保留 2 张代表参与竞争
 26 组代表
-    ↓ Layer 3: 审美评分（NIMA-VGG16，RTX 5070）
-    ↓   按分数排序
+    ↓ Layer 3: 审美评分（TOPIQ-IAA + VLM 多路融合，GPU/API）
+    ↓   按融合分排序
 Top 12
     ↓ Layer 4: 人脸质量（MediaPipe，CPU）
-    ↓   闭眼/微笑检测
-    ↓ Layer 5: 深度分析（Qwen-VL API）
-    ↓   分类/构图/改进/情绪/文案
-输出：精选照片 + 评分 + 文案
+    ↓   闭眼/人脸清晰度检测，硬伤钳制
+输出：精选照片 + 评分 + 标签/建议
 ```
 
 <details>
-<summary>五层流水线详情</summary>
+<summary>四层流水线详情</summary>
 
 | 层级 | 功能 | 核心技术 | 说明 |
 |------|------|----------|------|
 | Layer 1 | 客观指标 | OpenCV（CPU） | 清晰度（拉普拉斯方差）、曝光（直方图分析）、噪声（信噪比） |
-| Layer 2 | 相似聚类 | pHash（CPU） | 感知哈希 + 汉明距离聚类，每组选最清晰代表 |
-| Layer 3 | 审美评分 | NIMA-VGG16（GPU） | AVA 数据集训练，SRCC 0.71，1-10 分评分 |
-| Layer 4 | 人脸质量 | MediaPipe（CPU） | 478 关键点 + 52 blendshape，闭眼/微笑/人脸清晰度检测 |
-| Layer 5 | 深度分析 | Qwen-VL Max API | 分类（8 类）、构图解读、改进建议、情绪图谱、平台定制文案 |
+| Layer 2 | 相似聚类 | pHash（CPU） | 感知哈希 + 汉明距离聚类，每组保留 2 张代表（连拍次佳也参与审美竞争） |
+| Layer 3 | 审美评分 | TOPIQ-IAA（GPU）+ VLM（API） | 精细化 VLM 评分（构图/色彩/光影）+ TOPIQ + L1/L4 四路融合，无脸照片权重重分配 |
+| Layer 4 | 人脸质量 | MediaPipe（CPU） | 478 关键点 + 52 blendshape，闭眼/人脸清晰度检测，硬伤钳制 |
 
 </details>
+
+> 视频处理：流式抽帧（1s 间隔）→ L1/L2/L4 本地快筛 → 合格帧进流水线，照片/视频各自独立榜单。
 
 ## 🚀 快速开始
 
@@ -82,7 +82,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
 创建 `.env` 文件：
 
 ```env
-# Qwen-VL API（用于深度分析）
+# Qwen-VL API（用于 L3 VLM 审美评分）
 QWEN_API_KEY=your_api_key_here
 QWEN_BASE_URL=https://llm-1r8e612iutxlixav.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen-vl-max
@@ -110,27 +110,26 @@ photo-rank/
 │   ├── __init__.py
 │   ├── layer1_objective.py      # Layer 1: 客观指标（清晰度/曝光/噪声）
 │   ├── layer2_similarity.py     # Layer 2: 相似聚类（pHash）
-│   ├── layer3_aesthetic.py      # Layer 3: 审美评分（NIMA-VGG16）
+│   ├── layer3_aesthetic.py      # Layer 3: 审美评分（TOPIQ-IAA + VLM）
 │   ├── layer4_face.py           # Layer 4: 人脸质量（MediaPipe）
-│   ├── layer5_analysis.py       # Layer 5: 深度分析（Qwen-VL）
 │   ├── models.py                # Pydantic 数据模型
 │   ├── logger.py                # 日志模块
-│   └── pipeline.py              # 流水线整合
+│   ├── image_cache.py           # 图像缓存
+│   ├── video_frames.py          # 视频流式抽帧
+│   └── pipeline.py              # 流水线整合（支持增量模式）
 ├── main.py                      # Web UI 启动
 ├── config.py                    # 配置文件
 ├── templates/
 │   └── index.html               # 前端 UI
-├── tests/                       # 单元测试（44 个）
-│   ├── test_config.py
-│   ├── test_layer1.py
-│   └── test_layer2.py
+├── tests/                       # 单元测试（172 个）
+│   ├── test_layer1.py ~ test_layer4.py
+│   ├── test_pipeline_*.py       # 增量/重跑/权重
+│   └── test_video_*.py          # 视频抽帧/榜单
 ├── docs/
-│   └── research/                # 研究报告
-│       ├── photo_aesthetic_models_research.md
-│       ├── photo-aesthetic-research-report.md
-│       ├── qwen-vl-photo-analysis-research.md
-│       └── web_ui_framework_research.md
-├── uploads/                     # 上传的照片
+│   ├── research/                # 研究报告
+│   └── wiki/                    # 用户/开发者指南
+├── wiki/                        # Obsidian 知识库
+├── uploads/                     # 上传的照片/视频
 ├── output/                      # 分析结果
 ├── pyproject.toml               # 项目配置（ruff 等）
 ├── requirements.txt             # 依赖
@@ -145,36 +144,34 @@ photo-rank/
 - **清晰度**: 拉普拉斯方差（Laplacian Variance）
 - **曝光**: 直方图分析（过曝/欠曝检测）
 - **噪声**: 信噪比（SNR）
-- **阈值**: 清晰度 > 100，曝光 < 30% 过曝
+- **阈值**: 见 `config.py`（清晰度 70、过曝像素占比 0.4 等，实测调优）
 
 ### Layer 2: 相似聚类
 
 - **算法**: 感知哈希（pHash）
-- **阈值**: 汉明距离 ≤ 10
-- **选择**: 每组选清晰度最高的代表
+- **阈值**: 汉明距离 ≤ 16，且限定同一天拍摄（防跨日期误合并）
+- **选择**: 每组按清晰度保留 2 张代表参与审美竞争
 
 ### Layer 3: 审美评分
 
-- **模型**: NIMA-VGG16（AVA 数据集训练）
-- **SRCC**: 0.71（Spearman 秩相关系数）
-- **分数范围**: 1-10（5 分是"普通"，6 分以上是"好看"）
-- **推理**: RTX 5070 CUDA，0.09GB 显存
+- **模型**: TOPIQ-IAA（GPU，批次归一化）+ VLM 多维度评分（rubric + 重试 + 校验）
+- **融合**: VLM 构图/色彩/光影（按平台权重加权）+ TOPIQ + L1 清晰度 + L4 人脸，四路融合
+- **容错**: VLM 降级时保留 face 权重；无脸照片自动重分配人脸权重
 
 ### Layer 4: 人脸质量
 
 - **模型**: MediaPipe Face Landmarker v1.0
 - **检测**: 478 个关键点 + 52 个 blendshape
-- **功能**: 闭眼检测、微笑检测、人脸清晰度
+- **功能**: 闭眼检测、人脸清晰度、硬伤钳制（评分上限约束）
 
-### Layer 5: 深度分析
+### 视频处理
 
-- **模型**: Qwen-VL Max API
-- **功能**:
-  - 分类（8 类：风景/人像/人文/美食/夜景/自拍/合照/其他）
-  - 构图解读（三分法/引导线/对称等）
-  - 改进建议（裁剪/调色/角度）
-  - 情绪图谱（快乐/宁静/震撼等）
-  - 文案生成（平台定制）
+- 流式抽帧（1s 间隔）→ L1/L2/L4 本地快筛
+- 合格帧进入完整流水线，视频独立双榜单
+
+### 增量模式
+
+- `incremental=True` 时只处理新增照片（基于 checkpoint 判重），与 rerun_layers 互斥
 
 ## 📊 研究报告
 
@@ -190,7 +187,7 @@ photo-rank/
 ### 运行测试
 
 ```bash
-# 运行全部测试（44 个）
+# 运行全部测试（172 个）
 python -m pytest tests/ -v
 
 # 代码风格检查
@@ -207,10 +204,18 @@ ruff check . --fix
 ```python
 "new_platform": {
     "name": "新平台",
-    "ratio": "3:4",
     "style": "风格描述",
+    "output_count": 12,
+    "weights": {
+        "composition": 0.35,  # 构图
+        "color": 0.30,        # 色彩
+        "lighting": 0.20,     # 光影
+        "face": 0.15,         # 人脸（总和恒为 1.0）
+    },
 }
 ```
+
+平台权重用于 L3 VLM 评分的加权融合（前端平台选择器已移除，默认小红书权重）。
 
 ### 自定义模型
 
@@ -223,6 +228,15 @@ model = pyiqa.create_metric('your_model_name', device='cuda')
 ```
 
 ## 📝 更新日志
+
+### v2.0.0 (2026-08-19)
+
+- ✅ 移除 Layer 5 深度分析层，分类标签并入 L3 VLM 评分
+- ✅ L3 升级：TOPIQ-IAA + 精细化 VLM 评分四路融合，无脸照片权重重分配
+- ✅ 视频支持：流式抽帧 + 本地快筛，照片/视频独立双榜单
+- ✅ 增量模式（incremental）与断点续跑，图像缓存
+- ✅ L1/L2 阈值调优，修复好图误杀与跨日期误合并；HEIC 上传修复
+- ✅ 测试扩充至 172 个（增量/重跑/权重/视频）
 
 ### v1.1.0 (2026-07-30)
 

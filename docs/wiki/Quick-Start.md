@@ -40,7 +40,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
 创建 `.env` 文件：
 
 ```env
-# Qwen-VL API（用于深度分析）
+# Qwen-VL API（用于 L3 VLM 审美评分）
 QWEN_API_KEY=your_api_key_here
 QWEN_BASE_URL=https://llm-1r8e612iutxlixav.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen-vl-max
@@ -66,18 +66,18 @@ python main.py
    - 拖拽照片到上传区域
    - 或点击上传区域选择文件
 
-2. **选择平台**
-   - 小红书（3:4 竖版）
-   - 朋友圈（1:1 正方形）
-   - 抖音（9:16 竖版）
+2. **平台权重**
+   - 默认使用小红书权重（前端平台选择器已移除）
+   - 平台权重定义在 `config.py` 的 `PLATFORMS` 字典
 
 3. **开始分析**
    - 点击"开始分析"按钮
    - 等待分析完成（通常 2-5 分钟）
+   - 也支持视频上传（流式抽帧，独立视频榜单）
 
 4. **查看结果**
    - 照片画廊显示评分
-   - 点击查看详情（分类/构图/改进/情绪/文案）
+   - 点击查看详情（评分明细/标签/建议）
 
 ## 下一步
 

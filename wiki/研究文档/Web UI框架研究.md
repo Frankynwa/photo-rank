@@ -12,6 +12,8 @@
 - [docs/wiki/Architecture.md](file://docs/wiki/Architecture.md)
 </cite>
 
+> ⚠️ 本文为历史研究资料（撰写于 v2.0.0 之前），其中描述的五层流水线 / Layer 5 深度分析等内容已过时：自 v2.0.0 起架构为四层流水线，原 Layer 5 职责并入 Layer 3 的 VLM 评分与 pipeline 融合逻辑。仅作当时选型参考，现状以 README 与 wiki 其他文档为准。
+
 ## 目录
 1. [引言](#引言)
 2. [项目结构](#项目结构)

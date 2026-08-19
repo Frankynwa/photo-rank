@@ -406,6 +406,64 @@ class TestParseDimensionJson:
         out = _parse_dimension_json(text)
         assert "category" not in out
 
+    def test_category_alias_normalized(self):
+        """同义/近义分类应归一到标准枚举，避免丢弃成未分类"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        base = ('{"reason": "ok", "composition_score": 7.0, "color_score": 7.0, '
+                '"lighting_score": 7.0, "overall_aesthetic_score": 7.0, "category": "%s"}')
+        assert _parse_dimension_json(base % "人文")["category"] == "人文纪实"
+        assert _parse_dimension_json(base % "夜景人像")["category"] == "人像"
+        assert _parse_dimension_json(base % "风光")["category"] == "风景"
+        assert _parse_dimension_json(base % "宠物")["category"] == "动物"
+
+
+# ---------------------------------------------------------------------------
+# VLM prompt 组装测试（有人脸完整版 / 无人脸瘦身版）
+# ---------------------------------------------------------------------------
+
+class TestBuildDimensionPrompt:
+    def test_face_summary_gets_full_prompt(self):
+        """有人脸信息时应注入完整版（含【主体判断】与闭眼规则）"""
+        from core.layer3_aesthetic import _build_dimension_prompt
+        summary = "【人脸检测信息】检测到 1 张人脸；主脸闭眼：否；主脸清晰度：清晰；人脸占比：半身。"
+        prompt = _build_dimension_prompt(summary)
+        assert summary in prompt
+        assert "【主体判断】" in prompt
+        assert "【合影评分细则】" in prompt
+        assert "9. 闭眼" in prompt
+
+    def test_no_face_gets_slim_prompt(self):
+        """L4 未检出人脸时应走瘦身版（不含人脸判读段落，防模型脑补人脸角色）"""
+        from core.layer3_aesthetic import _build_dimension_prompt
+        prompt = _build_dimension_prompt("【人脸检测信息】未检测到人脸，请聚焦场景本身。")
+        assert "【主体判断】" not in prompt
+        assert "【合影评分细则】" not in prompt
+        assert "9. 闭眼" not in prompt
+        assert "【评审流程】" in prompt  # 硬伤预检仍保留（1-8 项）
+
+    def test_none_face_summary_gets_slim_prompt(self):
+        """无 L4 数据（L3 独立运行）时同样走瘦身版"""
+        from core.layer3_aesthetic import _build_dimension_prompt
+        prompt = _build_dimension_prompt(None)
+        assert "【主体判断】" not in prompt
+        assert "臆测" not in prompt
+
+    def test_enums_expanded_from_tuples(self):
+        """硬伤/分类枚举应由代码元组动态拼入，无残留占位符"""
+        from core.layer3_aesthetic import _build_dimension_prompt
+        prompt = _build_dimension_prompt(None)
+        assert "{HARD_FLAW_ENUM}" not in prompt
+        assert "{CATEGORY_ENUM}" not in prompt
+        assert "模糊 / 过曝" in prompt
+        assert "风景 / 建筑 / 人像" in prompt
+
+    def test_no_unresolved_face_placeholder(self):
+        """最终 prompt 不应残留 {FACE_INFO} 占位符"""
+        from core.layer3_aesthetic import _build_dimension_prompt
+        for summary in (None, "【人脸检测信息】未检测到人脸，请聚焦场景本身。",
+                        "【人脸检测信息】检测到 1 张人脸；主脸闭眼：否；"):
+            assert "{FACE_INFO}" not in _build_dimension_prompt(summary)
+
 
 # ---------------------------------------------------------------------------
 # VLM 人像硬伤钳制测试（程序化兜底，不依赖 LLM 自觉）

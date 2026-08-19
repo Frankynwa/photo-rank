@@ -50,15 +50,32 @@ def release_topiq_model(device: str | None = None) -> None:
             torch.cuda.empty_cache()
         gc.collect()
 
-# VLM 分类标签枚举（与 prompt 中的分类清单保持一致）
+# VLM 分类标签枚举（prompt 中的分类清单由本元组动态生成，单一来源防契约错位）
 _CATEGORIES = ("风景", "建筑", "人像", "人文纪实", "美食", "动物", "夜景", "其他")
 
-# VLM 硬伤枚举白名单（与 prompt 中 hard_flaws 枚举保持一致，用于解析校验）
+# 分类别名归一：模型输出同义/近义词时映射回标准枚举，避免丢弃成"未分类"
+_CATEGORY_ALIASES = {
+    "人文": "人文纪实", "纪实": "人文纪实", "街头": "人文纪实", "街头人文": "人文纪实",
+    "人物": "人像", "夜景人像": "人像", "环境人像": "人像",
+    "风光": "风景", "自然风光": "风景",
+    "宠物": "动物", "野生动物": "动物",
+    "食物": "美食",
+    "夜色": "夜景",
+}
+
+# VLM 硬伤枚举白名单（prompt 中的硬伤清单由本元组动态生成，单一来源防契约错位）
 _HARD_FLAW_ENUMS = ("模糊", "过曝", "欠曝", "噪点明显", "歪斜", "画面杂乱", "主体裁切", "逆光发黑", "地平线穿头", "闭眼", "人脸模糊")
 
-_DIMENSION_PROMPT = """你是从业 15 年的资深旅行摄影师兼选片师，为摄影比赛和社交平台评审过大量照片。
-请以大众审美标准评审这张旅行照片。
+# L4 "未检测到人脸"文案标记：命中时走瘦身版 prompt（省去人脸判读段落）
+_NO_FACE_MARKER = "未检测到人脸"
 
+# prompt 分段组装：_PROMPT_HEADER + （有人脸时）_FACE_SECTION + 硬伤预检 + _RUBRIC + _OUTPUT_REQ
+# 无人脸照片走瘦身版（不含【主体判断】【合影细则】与闭眼相关规则，省 token 且防模型脑补人脸角色）
+_PROMPT_HEADER = """你是从业 15 年的资深旅行摄影师兼选片师，为摄影比赛和社交平台评审过大量照片。
+请以大众审美标准评审这张旅行照片。
+"""
+
+_FACE_SECTION = """
 {FACE_INFO}
 
 【主体判断】
@@ -75,7 +92,9 @@ C. 画面同时存在主体人物与环境人群（如舞台表演者与观众�
 - 构图：重点检查边缘人物被裁切、头顶间距过挤、地平线穿头/穿肩
 - 表情协调：整体自然、有互动感、氛围愉悦为加分项；表情僵硬/各异为减分项
 - 综合审美：合影侧重情感氛围与纪念价值，不苛求单张人像的精致度
+"""
 
+_HARD_FLAW_CHECK_FACE = """
 【评审流程】
 第一步，先在心里快速检查以下硬伤（不用输出）：
 1. 画面模糊/失焦  2. 严重过曝或欠曝（死白/死黑）  3. 噪点明显
@@ -84,7 +103,18 @@ C. 画面同时存在主体人物与环境人群（如舞台表演者与观众�
 9. 闭眼：以【人脸检测信息】中"主脸闭眼/存在闭眼者"标注为准（无需肉眼再判断）
 存在任何硬伤：对应维度的分数上限为 4 分；闭眼作为人像硬伤时，综合审美上限 6 分。
 人脸模糊不做硬性上限——清晰度问题请在对应维度分中自然体现，人脸模糊的钳制由系统基于人脸检测客观数据另行把关。
+"""
 
+_HARD_FLAW_CHECK_PLAIN = """
+【评审流程】
+第一步，先在心里快速检查以下硬伤（不用输出）：
+1. 画面模糊/失焦  2. 严重过曝或欠曝（死白/死黑）  3. 噪点明显
+4. 水平线明显歪斜  5. 画面杂乱/多余元素入画  6. 主体被裁切
+7. 逆光导致主体发黑  8. 地平线穿头/穿肩
+存在任何硬伤：对应维度的分数上限为 4 分。
+"""
+
+_RUBRIC = """
 第二步，按以下标准给四个维度打分（1-10 分，允许一位小数）：
 
 - composition_score 构图：
@@ -115,17 +145,43 @@ C. 画面同时存在主体人物与环境人群（如舞台表演者与观众�
 【评分校准】
 - 5 分 = 普通随手拍的平均水准
 - 6-7 分 = 拍得不错的旅行照片，值得分享
-- 8 分以上 = 专业级/封面水平，严格控制，10 张里最多 1 张
+- 8 分以上 = 专业级/封面水平，仅在画面确实达到该水准时给出，宁缺毋滥
 - 4 分以下 = 有明显问题，一般不值得保留
+"""
 
+_OUTPUT_REQ = """
 【输出要求】
 - 先在心里完成评审流程，再简要说明打分理由（30-50 字），最后给分数。
 - hard_flaws：从以下枚举中选你实际检测到的硬伤（可多个，无则填"无硬伤"）：
-  "模糊" / "过曝" / "欠曝" / "噪点明显" / "歪斜" / "画面杂乱" / "主体裁切" / "逆光发黑" / "地平线穿头" / "闭眼" / "人脸模糊"
+  {HARD_FLAW_ENUM}
   必须输出该字段，硬伤检查不可跳过；存在任何硬伤时对应维度上限 4 分（人脸模糊除外，其仅按自然减分处理）。
-- 照片类型（category）从以下枚举中选一个：风景 / 建筑 / 人像 / 人文纪实 / 美食 / 动物 / 夜景 / 其他。
+- 照片类型（category）从以下枚举中选一个：{CATEGORY_ENUM}。
   按画面中最突出的主体与场景判断，只选一个，不要输出枚举之外的词。
+  主体与场景属性冲突时按主体归类（如夜晚拍摄的人像 → 人像）；夜景仅用于以夜景本身为主要观赏对象的照片。
 - 只返回 JSON：{"reason": "理由", "hard_flaws": [...], "composition_score": x, "color_score": x, "lighting_score": x, "overall_aesthetic_score": x, "category": "分类"}"""
+
+
+def _build_dimension_prompt(face_summary: str | None) -> str:
+    """组装 VLM 评分 prompt
+
+    - 有人脸信息 → 完整版（含【主体判断】【合影细则】与闭眼规则）
+    - 无人脸（L4 未检出 / L3 独立运行）→ 瘦身版（省去人脸判读段落，
+      省 token 且防模型对无脸照片脑补人脸角色）
+    - 硬伤/分类枚举由 _HARD_FLAW_ENUMS / _CATEGORIES 元组动态拼入，单一来源
+    """
+    has_face_info = bool(face_summary) and _NO_FACE_MARKER not in face_summary
+    parts = [_PROMPT_HEADER]
+    if has_face_info:
+        parts.append(_FACE_SECTION.replace("{FACE_INFO}", face_summary))
+        parts.append(_HARD_FLAW_CHECK_FACE)
+    else:
+        parts.append(_HARD_FLAW_CHECK_PLAIN)
+    parts.append(_RUBRIC)
+    parts.append(_OUTPUT_REQ)
+    prompt = "".join(parts)
+    prompt = prompt.replace("{HARD_FLAW_ENUM}", " / ".join(_HARD_FLAW_ENUMS))
+    prompt = prompt.replace("{CATEGORY_ENUM}", " / ".join(_CATEGORIES))
+    return prompt
 
 
 def score_topiq(
@@ -443,8 +499,12 @@ def _parse_dimension_json(text: str) -> dict:
             if valid_flaws:
                 out["hard_flaws"] = valid_flaws[:5]
         category = obj.get("category")
-        if isinstance(category, str) and category.strip() in _CATEGORIES:
-            out["category"] = category.strip()
+        if isinstance(category, str):
+            cat = category.strip()
+            if cat in _CATEGORIES:
+                out["category"] = cat
+            elif cat in _CATEGORY_ALIASES:
+                out["category"] = _CATEGORY_ALIASES[cat]
         return out
     logger.warning(f"无法从 VLM 回复中解析维度分数: {text[:120]}")
     return {}
@@ -493,15 +553,7 @@ async def _analyze_dimensions(
     img.save(buffer, format="JPEG", quality=VLM_JPEG_QUALITY)
     b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-    prompt = _DIMENSION_PROMPT
-    if face_summary:
-        prompt = prompt.replace("{FACE_INFO}", face_summary)
-    else:
-        # 无 L4 数据（L3 独立运行/测试场景）：中立占位，避免臆测人脸
-        prompt = prompt.replace(
-            "{FACE_INFO}",
-            "【人脸检测信息】未提供人脸检测数据，请直接依据画面内容判断，不要臆测人脸信息。",
-        )
+    prompt = _build_dimension_prompt(face_summary)
 
     url = f"{base_url}/chat/completions"
     last_err: Exception | None = None
@@ -525,6 +577,11 @@ async def _analyze_dimensions(
                         }],
                         "max_tokens": 400,
                         "temperature": 0.1,
+                        # 评分任务不需要思考链：显式关闭，防思考 token 挤占
+                        # max_tokens 导致 JSON 截断（→ 解析失败白重试），同时提速省费
+                        "enable_thinking": False,
+                        # JSON 强约束输出，减少解析失败（_parse_dimension_json 正则保留作兜底）
+                        "response_format": {"type": "json_object"},
                     },
                 )
                 response.raise_for_status()

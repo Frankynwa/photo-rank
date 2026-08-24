@@ -54,6 +54,19 @@ def _effective_weights(has_face: bool, has_vlm: bool = False) -> dict[str, float
     return w
 
 
+def _face_hard_flag(r: Layer4Result) -> str | None:
+    """L4 人像硬伤触发源："blink"（主脸闭眼）/ "blur"（主脸占比 >10% 且清晰度 <0.10）/ None
+
+    仅给出客观触发源，是否钳制由 layer3 结合 VLM 主体裁断
+    （person_is_subject / 自报硬伤）统一决定，见 _apply_dims_to_result。
+    """
+    if r.main_face_blink:
+        return "blink"
+    if r.has_face and r.face_ratio > 0.10 and r.face_clarity < 0.10:
+        return "blur"
+    return None
+
+
 def _emit(progress_callback, event: str, **data):
     """安全调用进度回调"""
     if progress_callback:
@@ -407,7 +420,7 @@ def run_pipeline(
     # L4 分析完一张立即发起该张的 VLM API 调用（与 TOPIQ 推理并行），
     # 消除"等全部 L4 完成才启动 VLM"的空等（VLM 是网络 IO 最慢环节，提前启动收益最大）
     # 增量重跑：L4 / TOPIQ 可从 checkpoint 独立恢复（rerun_layers 指定重跑部分）
-    vlm_tasks: list[tuple[str, object, bool]] = []  # (path, VLM future, hard_flag)
+    vlm_tasks: list[tuple[str, object, str | None]] = []  # (path, VLM future, hard_flag)
     api_key = os.environ.get("QWEN_API_KEY", "")
     l4_ckpt_ok = bool(checkpoint and checkpoint["completed_layer"] >= 3 and checkpoint.get("face_results"))
     topiq_ckpt_ok = bool(checkpoint and checkpoint["completed_layer"] >= 4 and checkpoint.get("aes_results"))
@@ -449,7 +462,7 @@ def run_pipeline(
                 if not api_key:
                     return
                 fsum = to_face_prompt_summary(r)
-                hflag = r.main_face_blink or (r.has_face and r.face_ratio > 0.10 and r.face_clarity < 0.10)
+                hflag = _face_hard_flag(r)
                 vlm_tasks.append((
                     r.path,
                     vlm_pool.submit(_run_dimension_analysis, r.path, face_summary=fsum),
@@ -522,15 +535,13 @@ def run_pipeline(
     for r in face_results:
         if r.face_count >= 6 and r.face_ratio < 0.10:
             face_scores[r.path] = 0.0
-    # 人像硬伤标记：主脸闭眼或主脸明显模糊（对应 prompt 硬伤预检第 9 条）
-    # 作为 VLM 综合审美 6 分上限的程序化钳制依据（不依赖 LLM 自觉）
-    # 收紧条件：仅当人脸占比 >10%（主体人像）且清晰度 <0.10（真糊）才判硬伤，
+    # 人像硬伤触发源："blink"（主脸闭眼）/ "blur"（主脸占比 >10% 且清晰度 <0.10）
+    # 最终是否钳制由 _apply_dims_to_result 结合 VLM 主体裁断决定（见 layer3）：
+    # 人物非主体（含背景路人/误检假脸）→ 永不钳制；blur 路径需 VLM 自报"人脸模糊"佐证
+    # 收紧条件：仅当人脸占比 >10%（主体人像）且清晰度 <0.10（真糊）才触发 blur，
     # 避免远景路人/正常拍摄的人像（人脸小、clarity 天然偏低）被误钳制到 6 分
     # （实测 0.25 阈值致 53 张含人照片几乎全部触发钳制，VLM 好分被归一化压至 ~2.6）
-    face_hard_flags = {
-        r.path: r.main_face_blink or (r.has_face and r.face_ratio > 0.10 and r.face_clarity < 0.10)
-        for r in face_results
-    }
+    face_hard_flags = {r.path: _face_hard_flag(r) for r in face_results}
 
     # ── Layer 3: 审美评分（TOPIQ 已与 L4 并发完成，VLM API 已在 L4 回调阶段逐张发起）──
     rerun_vlm = "vlm" in rerun
@@ -596,12 +607,13 @@ def run_pipeline(
                                     _run_dimension_analysis, r.path,
                                     face_summary=to_face_prompt_summary(fr),
                                 ),
-                                fr.main_face_blink or (fr.has_face and fr.face_ratio > 0.10 and fr.face_clarity < 0.10),
+                                _face_hard_flag(fr),
                             ))
                 from core.layer3_aesthetic import (
                     _apply_dims_to_result,
-                    _is_hard_flaw,
+                    _decide_vlm_clamp,
                     _normalize_vlm_batch,
+                    clamp_hard_flaws_after_normalize,
                 )
                 topiq_by_path = {r.path: r for r in aes_topiq_results}
                 for path, fut, hflag in vlm_tasks:
@@ -620,11 +632,16 @@ def run_pipeline(
                     _normalize_vlm_batch([r for r in aes_topiq_results if r.path in set(scoring_targets)])
                 else:
                     _normalize_vlm_batch(aes_topiq_results)
+                # checkpoint 恢复的旧 VLM 记录无 vlm_clamp 字段（默认 False），
+                # 用 L4 触发源 + 已存 person_is_subject/hard_flaws 回填，再统一钳制
                 for r in aes_topiq_results:
-                    if r.vlm_overall_score > 6.0 and _is_hard_flaw(r, face_hard_flags):
-                        r.vlm_overall_score = 6.0
-                        if "已钳制至 6 分上限" not in r.score_reason:
-                            r.score_reason += "（人像硬伤，已钳制至 6 分上限）"
+                    if r.vlm_overall_score > 0 and not r.vlm_clamp:
+                        r.vlm_clamp = _decide_vlm_clamp(
+                            face_hard_flags.get(r.path),
+                            r.person_is_subject,
+                            r.hard_flaws,
+                        )
+                clamp_hard_flaws_after_normalize(aes_topiq_results)
             else:
                 # 无 API key：VLM 维度默认值 5.0（与 apply_vlm_dimensions 行为一致）
                 for result in aes_topiq_results:
@@ -939,10 +956,7 @@ def run_video_ranking(
     # L3 VLM 维度分析
     face_scores = {r.path: r.overall_face_score for r in face_results}
     face_summaries = {r.path: to_face_prompt_summary(r) for r in face_results}
-    face_hard_flags = {
-        r.path: r.main_face_blink or (r.has_face and r.face_ratio > 0.10 and r.face_clarity < 0.10)
-        for r in face_results
-    }
+    face_hard_flags = {r.path: _face_hard_flag(r) for r in face_results}
     try:
         aes_results = apply_vlm_dimensions(
             aes_topiq_results,

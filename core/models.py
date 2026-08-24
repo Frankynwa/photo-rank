@@ -48,6 +48,8 @@ class Layer3Result(BaseModel):
     score_reason: str = ""  # VLM 评分理由
     hard_flaws: list[str] = []  # VLM 自报硬伤列表（闭眼/模糊/过曝等，用于钳制与诊断）
     category: str = ""  # VLM 分类标签（风景/建筑/人像/人文纪实/美食/动物/夜景/其他）
+    person_is_subject: Optional[bool] = None  # VLM 裁断：人物/人脸是否为拍摄主体（None=VLM 未输出该字段）
+    vlm_clamp: bool = False  # 人像硬伤钳制判定（_apply_dims 决策，归一化后统一钳制 ≤6）
     error: Optional[str] = None
     device: str = "cpu"
 

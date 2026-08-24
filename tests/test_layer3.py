@@ -470,35 +470,45 @@ class TestBuildDimensionPrompt:
 # ---------------------------------------------------------------------------
 
 class TestHardFlagClamping:
-    def test_hard_flag_clamps_overall_to_6(self):
-        """人像硬伤（闭眼/主脸模糊）时综合审美应钳制至 6 分上限"""
-        from core.layer3_aesthetic import _apply_dims_to_result
+    """两阶段钳制语义：_apply_dims 仅记录 vlm_clamp 不改分，
+    归一化后由 clamp_hard_flaws_after_normalize 统一钳制 ≤6（F3）"""
+
+    def test_hard_flag_clamps_after_normalize(self):
+        """人像硬伤（闭眼）时 vlm_clamp=True，归一化后钳制至 6 分上限"""
+        from core.layer3_aesthetic import _apply_dims_to_result, clamp_hard_flaws_after_normalize
         r = Layer3Result(path="/a.jpg", filename="a.jpg")
         dims = {"composition_score": 8.0, "color_score": 7.5,
                 "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
                 "reason": "构图不错但闭眼"}
-        _apply_dims_to_result(r, dims, hard_flag=True)
+        _apply_dims_to_result(r, dims, hard_flag="blink")
+        assert r.vlm_overall_score == 6.8  # apply 阶段不改分
+        assert r.vlm_clamp is True
+        clamp_hard_flaws_after_normalize([r])
         assert r.vlm_overall_score == 6.0
         assert "已钳制至 6 分上限" in r.score_reason
 
     def test_no_hard_flag_keeps_vlm_score(self):
-        """无人像硬伤时综合审美保持 VLM 原分"""
-        from core.layer3_aesthetic import _apply_dims_to_result
+        """无人像硬伤时综合审美保持 VLM 原分，不钳制"""
+        from core.layer3_aesthetic import _apply_dims_to_result, clamp_hard_flaws_after_normalize
         r = Layer3Result(path="/a.jpg", filename="a.jpg")
         dims = {"composition_score": 8.0, "color_score": 7.5,
                 "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
                 "reason": "整体不错"}
         _apply_dims_to_result(r, dims, hard_flag=False)
+        assert r.vlm_clamp is False
+        clamp_hard_flaws_after_normalize([r])
         assert r.vlm_overall_score == 6.8
         assert r.score_reason == "整体不错"
 
     def test_hard_flag_below_6_not_raised(self):
         """硬伤照片 VLM 分本就低于 6 时不应被抬高"""
-        from core.layer3_aesthetic import _apply_dims_to_result
+        from core.layer3_aesthetic import _apply_dims_to_result, clamp_hard_flaws_after_normalize
         r = Layer3Result(path="/a.jpg", filename="a.jpg")
         dims = {"composition_score": 5.0, "color_score": 5.0,
                 "lighting_score": 5.0, "overall_aesthetic_score": 5.5}
-        _apply_dims_to_result(r, dims, hard_flag=True)
+        _apply_dims_to_result(r, dims, hard_flag="blink")
+        assert r.vlm_clamp is True
+        clamp_hard_flaws_after_normalize([r])
         assert r.vlm_overall_score == 5.5
 
 
@@ -528,8 +538,8 @@ class TestHardFlawsParsing:
     def test_vlm_hard_flaw_triggers_clamp(self):
         """VLM 自报闭眼应触发钳制（辅助信号，即使 L4 未标记）
 
-        注意：自报"人脸模糊"不再触发钳制（实测被 L4 prompt 注入文案诱导误报，
-        人脸模糊仅由 L4 客观阈值把关），见 test_face_blur_no_clamp。
+        注意：自报"人脸模糊"不再单独触发钳制，仅作 blur 路径的佐证信号，
+        见 TestClampSubjectGating。
         """
         from core.layer3_aesthetic import _apply_dims_to_result
         r = Layer3Result(path="/a.jpg", filename="a.jpg")
@@ -537,29 +547,29 @@ class TestHardFlawsParsing:
                 "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
                 "hard_flaws": ["闭眼"]}
         _apply_dims_to_result(r, dims, hard_flag=False)  # L4 未标记
-        assert r.vlm_overall_score == 6.0  # VLM 自报闭眼 → 钳制
+        assert r.vlm_clamp is True  # VLM 自报闭眼 → 钳制
         assert "闭眼" in r.hard_flaws
 
     def test_face_blur_no_clamp(self):
-        """VLM 自报"人脸模糊"不再触发 6 分钳制（L4 客观数据已另行把关）"""
+        """无 L4 blur 触发时，VLM 自报"人脸模糊"不单独触发钳制"""
         from core.layer3_aesthetic import _apply_dims_to_result
         r = Layer3Result(path="/a.jpg", filename="a.jpg")
         dims = {"composition_score": 8.0, "color_score": 7.5,
                 "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
                 "hard_flaws": ["人脸模糊"]}
         _apply_dims_to_result(r, dims, hard_flag=False)
-        assert r.vlm_overall_score == 6.8  # 人脸模糊自报 → 不钳制，保留原分
+        assert r.vlm_clamp is False  # 不钳制，保留原分
         assert "人脸模糊" in r.hard_flaws  # 仍记录硬伤（供维度分参考）
 
     def test_l4_hard_flag_clamp(self):
-        """L4 客观硬伤（hard_flag=True）仍触发钳制，不依赖 VLM 自报"""
+        """L4 客观闭眼（hard_flag="blink"）仍触发钳制，不依赖 VLM 自报"""
         from core.layer3_aesthetic import _apply_dims_to_result
         r = Layer3Result(path="/a.jpg", filename="a.jpg")
         dims = {"composition_score": 8.0, "color_score": 7.5,
                 "lighting_score": 7.0, "overall_aesthetic_score": 6.8,
                 "hard_flaws": []}
-        _apply_dims_to_result(r, dims, hard_flag=True)  # L4 客观判定硬伤
-        assert r.vlm_overall_score == 6.0
+        _apply_dims_to_result(r, dims, hard_flag="blink")  # L4 客观判定闭眼
+        assert r.vlm_clamp is True
 
     def test_non_face_flaw_no_clamp(self):
         """非人像硬伤（如过曝）不应触发 6 分钳制"""
@@ -642,3 +652,101 @@ class TestNormalizeVlmBatch:
         ]
         _normalize_vlm_batch(results)
         assert all(r.vlm_overall_score == 6.0 for r in results)
+
+
+# ---------------------------------------------------------------------------
+# 钳制主体门控测试（F1：person_is_subject 门控 + F2：blur 双证据）
+# ---------------------------------------------------------------------------
+
+class TestClampSubjectGating:
+    """背景路人/误检假脸（person_is_subject=False）永不钳制；
+    blur 路径需 L4 低清晰度 + VLM 自报"人脸模糊"双证据（豁免墨镜/侧脸）"""
+
+    def test_person_not_subject_never_clamps(self):
+        """人物非主体（含误检假脸/背景路人）→ 即使 L4 触发也永不钳制"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        for flag in ("blink", "blur", True):
+            r = Layer3Result(path="/a.jpg", filename="a.jpg")
+            dims = {"composition_score": 8.5, "color_score": 8.0,
+                    "lighting_score": 8.0, "overall_aesthetic_score": 8.2,
+                    "person_is_subject": False, "hard_flaws": ["闭眼", "人脸模糊"]}
+            _apply_dims_to_result(r, dims, hard_flag=flag)
+            assert r.vlm_clamp is False, f"hard_flag={flag} 时不应钳制"
+            assert r.person_is_subject is False
+
+    def test_blur_needs_vlm_corroboration(self):
+        """blur 触发 + VLM 确认主体且自报人脸模糊 → 钳制（真糊）"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 6.0, "color_score": 6.0,
+                "lighting_score": 6.0, "overall_aesthetic_score": 7.0,
+                "person_is_subject": True, "hard_flaws": ["人脸模糊"]}
+        _apply_dims_to_result(r, dims, hard_flag="blur")
+        assert r.vlm_clamp is True
+
+    def test_blur_without_vlm_corroboration_no_clamp(self):
+        """blur 触发但 VLM 未报人脸模糊（墨镜/侧脸/纹理误检）→ 不钳制"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5,
+                "lighting_score": 7.5, "overall_aesthetic_score": 8.0,
+                "person_is_subject": True, "hard_flaws": []}
+        _apply_dims_to_result(r, dims, hard_flag="blur")
+        assert r.vlm_clamp is False
+
+    def test_blur_missing_subject_falls_back_to_clamp(self):
+        """VLM 未输出 person_is_subject（解析降级）时 blur 回落旧逻辑钳制，保住兜底"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 6.0, "color_score": 6.0,
+                "lighting_score": 6.0, "overall_aesthetic_score": 7.0}
+        _apply_dims_to_result(r, dims, hard_flag="blur")
+        assert r.person_is_subject is None
+        assert r.vlm_clamp is True
+
+    def test_blink_subject_true_still_clamps(self):
+        """主体人像闭眼（blink 路径）正常钳制，不受 F2 影响"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 7.0, "color_score": 7.0,
+                "lighting_score": 7.0, "overall_aesthetic_score": 7.5,
+                "person_is_subject": True, "hard_flaws": []}
+        _apply_dims_to_result(r, dims, hard_flag="blink")
+        assert r.vlm_clamp is True
+
+
+class TestPersonIsSubjectParsing:
+    def test_bool_parsed(self):
+        """person_is_subject 布尔字段应被解析"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        for val, expect in ((True, True), (False, False)):
+            text = ('{"reason": "ok", "hard_flaws": [], "composition_score": 7.0, '
+                    '"color_score": 7.0, "lighting_score": 7.0, '
+                    f'"overall_aesthetic_score": 7.0, "person_is_subject": {str(val).lower()}}}')
+            out = _parse_dimension_json(text)
+            assert out["person_is_subject"] is expect
+
+    def test_bool_string_tolerated(self):
+        """布尔字符串（"true"/"False"）应被容忍解析"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "ok", "hard_flaws": [], "composition_score": 7.0, '
+                '"color_score": 7.0, "lighting_score": 7.0, '
+                '"overall_aesthetic_score": 7.0, "person_is_subject": "False"}')
+        out = _parse_dimension_json(text)
+        assert out["person_is_subject"] is False
+
+    def test_invalid_value_ignored(self):
+        """非布尔值（如 "maybe"）应被忽略，由钳制逻辑回落兜底"""
+        from core.layer3_aesthetic import _parse_dimension_json
+        text = ('{"reason": "ok", "hard_flaws": [], "composition_score": 7.0, '
+                '"color_score": 7.0, "lighting_score": 7.0, '
+                '"overall_aesthetic_score": 7.0, "person_is_subject": "maybe"}')
+        out = _parse_dimension_json(text)
+        assert "person_is_subject" not in out
+
+    def test_prompt_requires_field(self):
+        """prompt 应要求输出 person_is_subject 并声明遮挡不影响判断"""
+        from core.layer3_aesthetic import _build_dimension_prompt
+        prompt = _build_dimension_prompt("【人脸检测信息】检测到 1 张人脸；主脸闭眼：否；")
+        assert "person_is_subject" in prompt
+        assert "墨镜" in prompt

@@ -158,7 +158,11 @@ _OUTPUT_REQ = """
 - 照片类型（category）从以下枚举中选一个：{CATEGORY_ENUM}。
   按画面中最突出的主体与场景判断，只选一个，不要输出枚举之外的词。
   主体与场景属性冲突时按主体归类（如夜晚拍摄的人像 → 人像）；夜景仅用于以夜景本身为主要观赏对象的照片。
-- 只返回 JSON：{"reason": "理由", "hard_flaws": [...], "composition_score": x, "color_score": x, "lighting_score": x, "overall_aesthetic_score": x, "category": "分类"}"""
+- person_is_subject：true/false。画面中人物/人脸是否为拍摄主体（无人物/人脸时填 false）。
+  墨镜/口罩/侧脸/虚化等遮挡不影响该判断，以画面实际内容为准。
+- 人脸模糊：仅当你从画面中实际观察到主体人脸失焦/模糊时才在 hard_flaws 中报告，
+  不要依据【人脸检测信息】中的清晰度指标推断。
+- 只返回 JSON：{"reason": "理由", "hard_flaws": [...], "composition_score": x, "color_score": x, "lighting_score": x, "overall_aesthetic_score": x, "category": "分类", "person_is_subject": true}"""
 
 
 def _build_dimension_prompt(face_summary: str | None) -> str:
@@ -289,23 +293,49 @@ def score_topiq(
     return results
 
 
-def _is_hard_flaw(result: Layer3Result, face_hard_flags: dict[str, bool] | None = None) -> bool:
-    """人像硬伤判定：L4 客观数据（主信号）或 VLM 自报闭眼（辅助信号）
+def clamp_hard_flaws_after_normalize(results: list[Layer3Result]) -> None:
+    """归一化后对人像硬伤照片统一钳制 ≤6（单次惩罚）
 
-    注意：VLM 自报"人脸模糊"不可作为钳制依据——L4 prompt 注入的
-    人脸清晰度文案会诱导 VLM 复述该硬伤（实测 53 张含人照片 52 张自报，
-    连 VLM 明言"非硬伤"的山羊照片都误报）；人脸模糊只由 L4 客观阈值把关。
+    钳制判定由 _apply_dims_to_result 写入 result.vlm_clamp；
+    必须在批次归一化之后调用——若先钳制再归一化，钳制值会被
+    p5-p95 拉伸二次压分（实测原始 8 分好片被压到 2.63）。
     """
-    if face_hard_flags and face_hard_flags.get(result.path):
-        return True
-    return any("闭眼" in f for f in result.hard_flaws)
+    for r in results:
+        if r.vlm_overall_score > 6.0 and r.vlm_clamp:
+            r.vlm_overall_score = 6.0
+            if "已钳制至 6 分上限" not in r.score_reason:
+                r.score_reason += "（人像硬伤，已钳制至 6 分上限）"
 
 
-def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: bool = False) -> None:
+def _decide_vlm_clamp(hard_flag: "str | bool | None", subject: bool | None, flaws: list) -> bool:
+    """人像硬伤钳制判定（L4 客观触发源 + VLM 主体裁断）
+
+    L4 无法判定"脸是否主体"与墨镜/侧脸等遮挡，VLM 裁断为准：
+    - subject=False（人物/人脸非主体，含背景路人/误检假脸）→ 永不钳制
+    - 闭眼路径（hard_flag="blink"/遗留 truthy 布尔，或 VLM 自报闭眼）→ 钳制
+    - 清晰度路径（hard_flag="blur"）→ 双证据：VLM 从像素确认"人脸模糊"才钳制
+      （豁免墨镜/侧脸/纹理误检）；VLM 未输出 person_is_subject（解析降级）时
+      回落旧逻辑钳制，保住程序化兜底
+    """
+    if subject is False:
+        return False  # 人物/人脸非主体：L4 人脸数据不参与钳制
+    vlm_blink = any("闭眼" in f for f in flaws)
+    if hard_flag == "blur":
+        # 清晰度触发需 VLM 像素级佐证；字段缺失时回落旧逻辑
+        return bool(any("人脸模糊" in f for f in flaws)) if subject is not None else True
+    if hard_flag:
+        return True  # 闭眼触发（L4 客观）或遗留布尔
+    return vlm_blink  # VLM 自报闭眼（辅助信号）
+
+
+def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: "str | bool" = False) -> None:
     """将 VLM 维度评分写入 Layer3Result（缺失字段回落默认值 5.0）
 
-    hard_flag=True 时表示 L4 检测到人像硬伤（主脸闭眼/主脸明显模糊），
-    综合审美钳制至 6 分上限（程序化兑底，不依赖 LLM 自觉遵守）。
+    hard_flag: L4 客观触发源——"blink"（主脸闭眼）/ "blur"（主脸清晰度低于阈值）/
+    遗留 truthy 布尔 / False。
+
+    钳制判定规则见 _decide_vlm_clamp；本函数不修改分数（F3），仅记录 vlm_clamp
+    与理由后缀，归一化后由 clamp_hard_flaws_after_normalize 统一钳制。
     """
     result.composition_score = round(dims.get("composition_score", 5.0), 4)
     result.color_score = round(dims.get("color_score", 5.0), 4)
@@ -314,12 +344,12 @@ def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: bool = Fa
         result.hard_flaws = list(dims["hard_flaws"])
     if dims.get("overall_aesthetic_score", 0) > 0:
         score = round(dims["overall_aesthetic_score"], 4)
-        # 钳制信号：L4 外部硬伤（hard_flag）或 VLM 自报闭眼
-        # （VLM 自报"人脸模糊"不可靠：L4 prompt 注入的清晰度文案会诱导其复述，
-        #   实测山羊照片 VLM 明言"非硬伤"仍误报；人脸模糊交由 L4 客观阈值把关）
-        vlm_hard = any("闭眼" in f for f in dims.get("hard_flaws", []))
-        if hard_flag or vlm_hard:
-            score = min(score, 6.0)
+        subject = dims.get("person_is_subject")
+        result.person_is_subject = subject if isinstance(subject, bool) else None
+        flaws = dims.get("hard_flaws", [])
+        clamp = _decide_vlm_clamp(hard_flag, result.person_is_subject, flaws)
+        result.vlm_clamp = clamp
+        if clamp:
             reason = dims.get("reason", "")
             suffix = "（人像硬伤：闭眼/主脸模糊，已钳制至 6 分上限）"
             result.score_reason = f"{reason}{suffix}" if reason else suffix.strip("（）")
@@ -341,7 +371,7 @@ def apply_vlm_dimensions(
     - VLM 调用为网络 IO、逐张独立 → 线程池并发（图片级流水：先完成的先返回）
     - 无 QWEN_API_KEY 时全部使用默认值 5.0
     - 评分失败的照片（error 非空）不调用 API，维度默认 5.0
-    - face_hard_flags: path -> 是否人像硬伤（L4 客观数据），硬伤照片综合审美钳制 ≤6
+    - face_hard_flags: path -> L4 触发源（"blink"/"blur"/None），钳制判定结合 VLM 主体裁断
     """
     api_key = os.environ.get("QWEN_API_KEY", "")
 
@@ -355,7 +385,7 @@ def apply_vlm_dimensions(
         def _work(result: Layer3Result) -> tuple[Layer3Result, dict, bool]:
             try:
                 face_summary = face_summaries.get(result.path) if face_summaries else None
-                hard_flag = bool(face_hard_flags.get(result.path)) if face_hard_flags else False
+                hard_flag = face_hard_flags.get(result.path) if face_hard_flags else False
                 return result, _run_dimension_analysis(result.path, face_summary=face_summary), hard_flag
             except Exception as e:
                 logger.warning(f"维度分析失败 {result.filename}: {e}")
@@ -382,12 +412,8 @@ def apply_vlm_dimensions(
         logger.info("多维度审美分析完成")
         # VLM 综合分批次归一化：拉开区分度、防分数膨胀（与 TOPIQ 归一化同构）
         _normalize_vlm_batch(results)
-        # 归一化可能拉伸硬伤钳制值 → 对硬伤照片重新钳制 ≤6（顺序保证）
-        for r in results:
-            if r.vlm_overall_score > 6.0 and _is_hard_flaw(r, face_hard_flags):
-                r.vlm_overall_score = 6.0
-                if "已钳制至 6 分上限" not in r.score_reason:
-                    r.score_reason += "（人像硬伤，已钳制至 6 分上限）"
+        # 归一化后对人像硬伤照片钳制 ≤6（单次惩罚，避免先钳制再归一化的二次压分）
+        clamp_hard_flaws_after_normalize(results)
     return results
 
 
@@ -505,6 +531,12 @@ def _parse_dimension_json(text: str) -> dict:
                 out["category"] = cat
             elif cat in _CATEGORY_ALIASES:
                 out["category"] = _CATEGORY_ALIASES[cat]
+        # person_is_subject：VLM 主体裁断（钳制门控依据）；容忍布尔字符串
+        pis = obj.get("person_is_subject")
+        if isinstance(pis, bool):
+            out["person_is_subject"] = pis
+        elif isinstance(pis, str) and pis.strip().lower() in ("true", "false"):
+            out["person_is_subject"] = pis.strip().lower() == "true"
         return out
     logger.warning(f"无法从 VLM 回复中解析维度分数: {text[:120]}")
     return {}

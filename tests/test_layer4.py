@@ -466,6 +466,18 @@ class TestToFacePromptSummary:
         text = to_face_prompt_summary(r)
         assert "疑似合影" in text
 
+    def test_low_clarity_neutral_wording(self):
+        """低清晰度不再输出负面定性（墨镜/侧脸/误检天然失真），改中性提示"""
+        from core.layer4_face import to_face_prompt_summary
+        for clarity_val in (0.12, 0.06):  # 原"轻微模糊"/"明显模糊"档
+            r = Layer4Result(
+                path="/a.jpg", filename="a.jpg", has_face=True, face_count=1,
+                face_clarity=clarity_val, face_ratio=0.24,
+            )
+            text = to_face_prompt_summary(r)
+            assert "清晰度指标偏低，请依据画面自行判断" in text
+            assert "模糊" not in text
+
 
 # ---------------------------------------------------------------------------
 # analyze_faces 模块级函数测试（全局实例复用）

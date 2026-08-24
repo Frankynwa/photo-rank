@@ -12,6 +12,8 @@ import imagehash
 import numpy as np
 import pytest
 
+from config import QWEN_MODEL
+from core.layer3_aesthetic import vlm_prompt_fingerprint
 from core.models import Layer1Result, Layer3Result, Layer4Result, SimilarityCluster
 from core.pipeline import run_pipeline
 
@@ -33,9 +35,11 @@ def fake_env(tmp_path, monkeypatch):
 
     phash_map = {p: f"{i:016x}" for i, p in enumerate(paths)}
     checkpoint = {
-        "version": 2,
+        "version": 3,
         "completed_layer": 4,
         "skipped_layers": [],
+        # 新鲜度指纹：与当前 prompt/模型一致 → 旧分可复用（不一致场景见 TestCheckpointStale）
+        "meta": {"prompt_hash": vlm_prompt_fingerprint(), "model": QWEN_MODEL},
         "kept": [
             Layer1Result(path=p, filename=Path(p).name, sharpness=300.0, exposure=1.0, noise=0.05, overall=0.8)
             for p in paths
@@ -247,3 +251,52 @@ class TestIncrementalWithNewPhoto:
 
         result = run_pipeline(photos_dir=env["photos_dir"], platform="xiaohongshu", incremental=True)
         assert result["ranked"] == 4
+
+
+class TestCheckpointStale:
+    """VLM 分新鲜度校验：prompt/模型指纹不匹配（或 v2 无指纹）→ 旧 VLM 分作废全量重评"""
+
+    def _stale_run(self, fake_env, monkeypatch, mutate_meta):
+        env = fake_env
+        ckpt_file = env["platform_dir"] / "checkpoint.json"
+        ckpt = json.loads(ckpt_file.read_text(encoding="utf-8"))
+        mutate_meta(ckpt)
+        ckpt_file.write_text(json.dumps(ckpt, ensure_ascii=False), encoding="utf-8")
+        monkeypatch.setenv("QWEN_API_KEY", "test-key")
+        calls = _install_fakes(monkeypatch, [])
+        result = run_pipeline(photos_dir=env["photos_dir"], platform="xiaohongshu", incremental=True)
+        return env, calls, result
+
+    def test_v2_no_meta_invalidates_vlm(self, fake_env, monkeypatch):
+        """v2 旧 checkpoint 无指纹 → 全部 3 张重评 VLM，TOPIQ/L4 复用"""
+
+        def _to_v2(ckpt):
+            ckpt["version"] = 2
+            ckpt.pop("meta", None)
+
+        env, calls, result = self._stale_run(fake_env, monkeypatch, _to_v2)
+        assert result["ranked"] == 3
+        assert sorted(calls["vlm"]) == sorted(env["paths"]), "旧 VLM 分应全量重评"
+        assert calls["l4"] == [], "L4 应复用 checkpoint"
+        assert calls["topiq"] == [], "TOPIQ 应复用 checkpoint"
+
+    def test_hash_mismatch_invalidates_vlm(self, fake_env, monkeypatch):
+        """指纹不匹配（prompt 已改）→ 同样全量重评 VLM"""
+        env, calls, result = self._stale_run(
+            fake_env, monkeypatch,
+            lambda ckpt: ckpt["meta"].update({"prompt_hash": "deadbeef00000000"})
+        )
+        assert result["ranked"] == 3
+        assert sorted(calls["vlm"]) == sorted(env["paths"])
+
+    def test_rerun_meta_written_after_stale(self, fake_env, monkeypatch):
+        """过期重评后产物携带新指纹：checkpoint meta 与 run_meta.json 一致"""
+        env, calls, result = self._stale_run(
+            fake_env, monkeypatch, lambda ckpt: ckpt.pop("meta", None)
+        )
+        ckpt = json.loads((env["platform_dir"] / "checkpoint.json").read_text(encoding="utf-8"))
+        assert ckpt["version"] == 3
+        assert ckpt["meta"]["prompt_hash"] == vlm_prompt_fingerprint()
+        meta = json.loads((env["platform_dir"] / "run_meta.json").read_text(encoding="utf-8"))
+        assert meta["prompt_hash"] == ckpt["meta"]["prompt_hash"]
+        assert meta["model"] == QWEN_MODEL

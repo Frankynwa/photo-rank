@@ -102,6 +102,9 @@ VIDEO_FRAME_BLUR_RATIO = 0.3
 VLM_IMAGE_MAX_SIDE = 1024
 # VLM 上传 JPEG 质量（85→80：体积约 -15%，视觉差异对 VLM 判断可忽略；体积直接影响 API 延迟）
 VLM_JPEG_QUALITY = 80
+# VLM 饱和重采样：原始分饱和（综合 ≥9.8 或三项维度全 ≥9）的照片追加一次评分取均值。
+# 默认关闭：每饱和一张多一次 API 调用；历史数据饱和占比 ~11%，全开成本不可忽视
+VLM_SATURATION_RESAMPLE = False
 
 # 最终综合分融合权重（总和 1.0）
 # vlm: VLM 多维度审美（按平台权重加权构图/色彩/光影）

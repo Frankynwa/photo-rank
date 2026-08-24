@@ -50,6 +50,8 @@ class Layer3Result(BaseModel):
     category: str = ""  # VLM 分类标签（风景/建筑/人像/人文纪实/美食/动物/夜景/其他）
     person_is_subject: Optional[bool] = None  # VLM 裁断：人物/人脸是否为拍摄主体（None=VLM 未输出该字段）
     vlm_clamp: bool = False  # 人像硬伤钳制判定（_apply_dims 决策，归一化后统一钳制 ≤6）
+    clamp_source: str = ""  # 钳制规则路径审计（blink_l4/blink_vlm/blur_dual/blur_fallback/blink_legacy，回填带 backfill: 前缀；空=未钳制）
+    vlm_saturated: bool = False  # VLM 原始分饱和旗标（综合分 ≥9.8 或三项维度全 ≥9，疑似锚点打分/捧分）
     error: Optional[str] = None
     device: str = "cpu"
 

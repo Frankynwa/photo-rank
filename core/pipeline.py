@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import shutil
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import imagehash
@@ -15,8 +17,10 @@ from config import (
     OUTPUT_DIR,
     PHOTOS_DIR,
     PLATFORMS,
+    QWEN_MODEL,
     VIDEO_FRAMES_DIR,
     VIDEO_OUTPUT_COUNT,
+    VLM_SATURATION_RESAMPLE,
 )
 from core.models import (
     FinalResult,
@@ -68,30 +72,49 @@ def _face_hard_flag(r: Layer4Result) -> str | None:
 
 
 def _report_scoring_health(aes_results: list[Layer3Result], label: str) -> None:
-    """跑后统计报警：钳制率/低分占比异常即打 warning
+    """跑后统计报警：钳制率/低分占比/饱和分/同分簇异常即打 warning
 
     历史教训：53 张中 29 张被误钳制（55%，pareidolia 误检 + 二次惩罚），
     系统静默通过，直到用户看照片才发现。加统计报警后同类 bug 分钟级可现。
+    报警附带具体文件名与规则分布（clamp_source），可直接定位取证。
     """
     scored = [r for r in aes_results if r.vlm_overall_score > 0]
     if not scored:
         return
-    clamped = sum(1 for r in scored if r.vlm_clamp)
+    clamped = [r for r in scored if r.vlm_clamp]
     low = sum(1 for r in scored if r.vlm_overall_score < 2.0)
-    clamp_rate = clamped / len(scored)
+    clamp_rate = len(clamped) / len(scored)
     low_rate = low / len(scored)
     logger.info(
-        f"[{label}] 评分健康: VLM 评分 {len(scored)} 张，钳制 {clamped} 张（{clamp_rate:.0%}），"
+        f"[{label}] 评分健康: VLM 评分 {len(scored)} 张，钳制 {len(clamped)} 张（{clamp_rate:.0%}），"
         f"低分(<2) {low} 张（{low_rate:.0%}）"
     )
     if clamp_rate > 0.20:
+        by_source = dict(Counter(r.clamp_source or "unknown" for r in clamped))
+        examples = ", ".join(r.filename for r in clamped[:3])
         logger.warning(
             f"[{label}] 钳制率 {clamp_rate:.0%} 超过 20%——疑似人脸硬伤判定误触发"
-            f"（检测误检/阈值漂移），请排查 L4 数据与 person_is_subject 分布"
+            f"（检测误检/阈值漂移），规则分布 {by_source}，例: {examples}"
         )
     if low_rate > 0.10:
         logger.warning(
             f"[{label}] 低分(<2) 占比 {low_rate:.0%} 超过 10%——疑似二次惩罚或归一化异常"
+        )
+    # 饱和分体检：VLM 锚点打分/捧分信号（实证：历史数据 11.1% 拿满分）
+    sat = sum(1 for r in scored if r.vlm_saturated)
+    if sat:
+        logger.info(f"[{label}] VLM 饱和分 {sat} 张（{sat / len(scored):.0%}）（综合≥9.8 或三维全≥9）")
+    # 同分簇体检：完全同分 ≥5 张 → 疑似锚点打分，头部区分度崩坏
+    vec_count = Counter(
+        (round(r.composition_score, 1), round(r.color_score, 1),
+         round(r.lighting_score, 1), round(r.vlm_overall_score, 2))
+        for r in scored
+    )
+    top_vec, top_n = vec_count.most_common(1)[0]
+    if top_n >= 5:
+        logger.warning(
+            f"[{label}] 同分簇异常: {top_n} 张分数完全一致 {list(top_vec)}——"
+            f"疑似 VLM 锚点打分，头部区分度下降"
         )
 
 
@@ -216,13 +239,22 @@ def _save_layer_checkpoint(output_dir: Path, layer: int, extra: dict) -> None:
     修复历史 bug：原实现每层只存自己的数据，中间层数据被覆盖，
     中断后无法从任意层恢复。累积式保存保证 checkpoint 始终包含
     所有已完成层的数据（kept/rejected/clusters/aes_results/face_scores/…）。
+
+    v3 起携带 meta（VLM prompt/模型指纹）：加载时校验，不一致则
+    旧 VLM 分作废重评，防新旧 prompt 分数静默混排。
     """
+    from core.layer3_aesthetic import vlm_prompt_fingerprint
+
     base = _load_checkpoint(output_dir) or {}
     skipped = list(base.get("skipped_layers", []))
     for s in extra.get("skipped_layers", []):
         if s not in skipped:
             skipped.append(s)
-    data = {**base, "version": 2, "completed_layer": layer, **extra, "skipped_layers": skipped}
+    data = {
+        **base, "version": 3, "completed_layer": layer, **extra,
+        "skipped_layers": skipped,
+        "meta": {"prompt_hash": vlm_prompt_fingerprint(), "model": QWEN_MODEL},
+    }
     _save_checkpoint(output_dir, data)
 
 
@@ -255,7 +287,7 @@ def run_pipeline(
     """
     from core.layer1_objective import batch_analyze_with_phash
     from core.layer2_similarity import cluster_photos
-    from core.layer3_aesthetic import score_topiq
+    from core.layer3_aesthetic import score_topiq, vlm_prompt_fingerprint
     from core.layer4_face import analyze_faces, to_face_prompt_summary
 
     photos_dir = Path(photos_dir or PHOTOS_DIR)
@@ -289,6 +321,7 @@ def run_pipeline(
     # 旧版 v1 checkpoint（completed_layer 为层号，且 L3 的 VLM 评分未注入人脸信息）：
     # 仅复用 L1/L2 数据，L4/L3 强制重跑。
     checkpoint = None if force else _load_checkpoint(output_dir)
+    prompt_hash = vlm_prompt_fingerprint()
 
     # 增量重跑依赖传播：上游层重跑 → 依赖它的下游层必须连带重跑
     rerun = _expand_rerun_layers(rerun_layers)
@@ -300,13 +333,28 @@ def run_pipeline(
         logger.info("[跳过L1] 模糊/曝光不拦截，全部照片进入后续层（强制全量重跑）")
         rerun = _expand_rerun_layers(["l1"])
 
+    # VLM 分新鲜度校验：prompt/模型已变更（或旧 v2 无指纹）时，旧 VLM 分与
+    # 新分语义不可比 → 强制全量重评 VLM（TOPIQ/L4 复用），防静默混排
+    if checkpoint and "vlm" not in rerun and checkpoint.get("version") in (2, 3):
+        cp_hash = (checkpoint.get("meta") or {}).get("prompt_hash")
+        if cp_hash != prompt_hash:
+            reason = "旧 checkpoint 无指纹(v2)" if cp_hash is None else f"指纹 {cp_hash} → {prompt_hash}"
+            logger.warning(
+                f"[Checkpoint] VLM 评分配置已变更（{reason}）："
+                f"全部旧 VLM 分作废重评（TOPIQ/L4 复用）"
+            )
+            rerun = rerun | {"vlm"}
+            if incremental:
+                logger.warning("[增量] 已禁用：VLM 评分配置变更，全部照片需重评 VLM")
+                incremental = False
+
     # 新增照片增量：只处理不在 checkpoint 中的照片，旧照片结果全部复用
     incremental_new: list[Path] = []
     if incremental:
         if rerun:
             logger.warning("[增量] 与 rerun_layers 同时传入，incremental 优先，忽略 rerun_layers")
             rerun = set()
-        if checkpoint and checkpoint.get("version") == 2:
+        if checkpoint and checkpoint.get("version") in (2, 3):
             known = {r["path"] for r in checkpoint.get("kept", [])} | {
                 r["path"] for r in checkpoint.get("rejected", [])
             }
@@ -320,10 +368,10 @@ def run_pipeline(
                     f"其余 {len(photos) - len(incremental_new)} 张复用 checkpoint"
                 )
         else:
-            logger.warning("[增量] 无可用 checkpoint（v2），退化为全量重跑")
+            logger.warning("[增量] 无可用 checkpoint（v2/v3），退化为全量重跑")
             incremental = False
     if checkpoint:
-        if checkpoint.get("version") == 2:
+        if checkpoint.get("version") in (2, 3):
             logger.info(
                 f"从步骤 {checkpoint['completed_layer'] + 1} 继续"
                 f"（跳过已完成 {checkpoint['completed_layer']} 步）"
@@ -644,16 +692,28 @@ def run_pipeline(
                 from core.layer3_aesthetic import (
                     _apply_dims_to_result,
                     _decide_vlm_clamp,
+                    _is_saturated,
+                    _merge_dims,
                     _normalize_vlm_batch,
+                    _run_dimension_analysis,
                     clamp_hard_flaws_after_normalize,
                 )
                 topiq_by_path = {r.path: r for r in aes_topiq_results}
+                face_by_path = {r.path: r for r in face_results}
                 for path, fut, hflag in vlm_tasks:
                     r = topiq_by_path.get(path)
                     if r is None or r.error:
                         continue  # TOPIQ 失败的照片不写 VLM 分
                     try:
                         dims = fut.result()
+                        if VLM_SATURATION_RESAMPLE and _is_saturated(dims):
+                            # 饱和重采样（默认关）：追加一次评分取均值，缓解锚点打分
+                            fr = face_by_path.get(path)
+                            fsum = to_face_prompt_summary(fr) if fr is not None else None
+                            try:
+                                dims = _merge_dims(dims, _run_dimension_analysis(path, face_summary=fsum))
+                            except Exception as e:
+                                logger.warning(f"饱和重采样失败 {r.filename}: {e}（采用首次评分）")
                     except Exception as e:
                         logger.warning(f"维度分析失败 {r.filename}: {e}")
                         dims = {}
@@ -668,11 +728,14 @@ def run_pipeline(
                 # 用 L4 触发源 + 已存 person_is_subject/hard_flaws 回填，再统一钳制
                 for r in aes_topiq_results:
                     if r.vlm_overall_score > 0 and not r.vlm_clamp:
-                        r.vlm_clamp = _decide_vlm_clamp(
+                        clamp, source = _decide_vlm_clamp(
                             face_hard_flags.get(r.path),
                             r.person_is_subject,
                             r.hard_flaws,
                         )
+                        r.vlm_clamp = clamp
+                        # 回填路径审计：带 backfill: 前缀区分于当场裁决
+                        r.clamp_source = f"backfill:{source}" if clamp else ""
                 clamp_hard_flaws_after_normalize(aes_topiq_results)
             else:
                 # 无 API key：VLM 维度默认值 5.0（与 apply_vlm_dimensions 行为一致）
@@ -791,6 +854,12 @@ def run_pipeline(
             "composition_score": r.composition_score,
             "color_score": r.color_score,
             "lighting_score": r.lighting_score,
+            # 审计三件套：钳制决策 + 规则路径 + VLM 主体裁断（跑后取证用）
+            "vlm_clamp": r.vlm_clamp,
+            "clamp_source": r.clamp_source,
+            "person_is_subject": r.person_is_subject,
+            "vlm_saturated": r.vlm_saturated,
+            "hard_flaws": r.hard_flaws,
             # 离群诊断：VLM 与 TOPIQ 严重分歧的照片（TOPIQ 有语义盲区，分歧≠错误）
             "vlm_topiq_divergence": _vlm_topiq_divergence(r, weights, dim_w_sum),
         }
@@ -801,6 +870,17 @@ def run_pipeline(
     with open(full_file, "w", encoding="utf-8") as f:
         json.dump(full_ranking, f, ensure_ascii=False, indent=2)
     logger.info(f"完整排行已保存: {len(full_ranking)} 条 → {full_file}")
+
+    # 跑批元信息（与 checkpoint meta 同源）：最终产物可追溯 prompt/模型版本
+    run_meta = {
+        "prompt_hash": prompt_hash,
+        "model": QWEN_MODEL,
+        "platform": platform,
+        "photo_count": len(full_ranking),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(output_dir / "run_meta.json", "w", encoding="utf-8") as f:
+        json.dump(run_meta, f, ensure_ascii=False, indent=2)
 
     # 复制照片（序号名，供前端展示）
     display_names: dict[str, str] = {}

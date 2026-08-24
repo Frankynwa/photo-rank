@@ -32,6 +32,7 @@ class TestGoldenClampCases:
         r = Layer3Result(path="/drink.jpg", filename="drink.jpg")
         _apply_dims_to_result(r, _dims(subject=False, flaws=[]), hard_flag="blur")
         assert r.vlm_clamp is False
+        assert r.clamp_source == ""  # 审计：未钳制无规则路径
         clamp_hard_flaws_after_normalize([r])
         assert r.vlm_overall_score == 8.2  # 分数完整保留
 
@@ -54,6 +55,7 @@ class TestGoldenClampCases:
         r = Layer3Result(path="/blur.jpg", filename="blur.jpg")
         _apply_dims_to_result(r, _dims(subject=True, flaws=["人脸模糊"]), hard_flag="blur")
         assert r.vlm_clamp is True
+        assert r.clamp_source == "blur_dual"  # 审计：模糊双证据路径
         clamp_hard_flaws_after_normalize([r])
         assert r.vlm_overall_score == 6.0
 
@@ -62,6 +64,7 @@ class TestGoldenClampCases:
         r = Layer3Result(path="/blink.jpg", filename="blink.jpg")
         _apply_dims_to_result(r, _dims(subject=True, flaws=[]), hard_flag="blink")
         assert r.vlm_clamp is True
+        assert r.clamp_source == "blink_l4"  # 审计：L4 客观闭眼路径
         clamp_hard_flaws_after_normalize([r])
         assert r.vlm_overall_score == 6.0
 

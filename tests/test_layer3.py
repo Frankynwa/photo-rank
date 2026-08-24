@@ -750,3 +750,116 @@ class TestPersonIsSubjectParsing:
         prompt = _build_dimension_prompt("【人脸检测信息】检测到 1 张人脸；主脸闭眼：否；")
         assert "person_is_subject" in prompt
         assert "墨镜" in prompt
+
+
+# ---------------------------------------------------------------------------
+# 钳制审计（clamp_source 规则路径）+ 饱和检测 + prompt 指纹
+# ---------------------------------------------------------------------------
+
+class TestClampSourceAudit:
+    """clamp_source 记录钳制规则路径，跑后可直接定位被钳制原因"""
+
+    def _apply(self, hard_flag, extra_dims=None):
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5,
+                "lighting_score": 7.0, "overall_aesthetic_score": 6.8}
+        dims.update(extra_dims or {})
+        _apply_dims_to_result(r, dims, hard_flag=hard_flag)
+        return r
+
+    def test_source_per_rule_path(self):
+        """各规则路径对应正确的 clamp_source 枚举值"""
+        assert self._apply("blink").clamp_source == "blink_l4"
+        assert self._apply(True).clamp_source == "blink_legacy"  # 遗留布尔
+        assert self._apply(False, {"hard_flaws": ["闭眼"]}).clamp_source == "blink_vlm"
+        assert self._apply(
+            "blur", {"person_is_subject": True, "hard_flaws": ["人脸模糊"]}
+        ).clamp_source == "blur_dual"
+        assert self._apply("blur").clamp_source == "blur_fallback"  # subject 缺失回落
+
+    def test_not_clamped_source_empty(self):
+        """未钳制时 clamp_source 为空串（含 subject=False 门控拦截）"""
+        assert self._apply(False).clamp_source == ""
+        assert self._apply(
+            "blink", {"person_is_subject": False, "hard_flaws": ["闭眼"]}
+        ).clamp_source == ""
+
+
+class TestSaturationDetection:
+    """VLM 原始分饱和检测（锚点打分/捧分信号，实证：历史数据 11.1% 拿满分）"""
+
+    def test_overall_near_max_saturated(self):
+        from core.layer3_aesthetic import _is_saturated
+        dims = {"composition_score": 8.0, "color_score": 8.0,
+                "lighting_score": 8.0, "overall_aesthetic_score": 9.8}
+        assert _is_saturated(dims) is True
+
+    def test_all_dims_high_saturated(self):
+        from core.layer3_aesthetic import _is_saturated
+        dims = {"composition_score": 9.0, "color_score": 9.5,
+                "lighting_score": 9.0, "overall_aesthetic_score": 9.2}
+        assert _is_saturated(dims) is True
+
+    def test_normal_scores_not_saturated(self):
+        from core.layer3_aesthetic import _is_saturated
+        dims = {"composition_score": 9.0, "color_score": 8.5,
+                "lighting_score": 9.0, "overall_aesthetic_score": 9.7}
+        assert _is_saturated(dims) is False
+        assert _is_saturated({}) is False
+
+    def test_flag_written_to_result(self):
+        """_apply_dims 应将饱和旗标写入 Layer3Result（不改分）"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 9.0, "color_score": 9.0,
+                "lighting_score": 9.0, "overall_aesthetic_score": 10.0}
+        _apply_dims_to_result(r, dims)
+        assert r.vlm_saturated is True
+        assert r.vlm_overall_score == 10.0  # 仅记录不干预
+
+    def test_merge_dims_averages(self):
+        """重采样合并：四项分数取均值，非分数字段以首次为准"""
+        from core.layer3_aesthetic import _merge_dims
+        first = {"composition_score": 9.0, "color_score": 9.0,
+                 "lighting_score": 9.0, "overall_aesthetic_score": 10.0,
+                 "reason": "首次理由", "category": "风景"}
+        second = {"composition_score": 7.0, "color_score": 8.0,
+                  "lighting_score": 7.0, "overall_aesthetic_score": 8.0,
+                  "reason": "二次理由"}
+        merged = _merge_dims(first, second)
+        assert merged["composition_score"] == 8.0
+        assert merged["overall_aesthetic_score"] == 9.0
+        assert merged["reason"] == "首次理由"
+        assert merged["category"] == "风景"
+        assert _merge_dims(first, {}) is first  # 重采样失败回落首次
+
+
+class TestPromptGranularityAndFingerprint:
+    def test_prompt_requires_decimal_granularity(self):
+        """prompt 应要求 0.1 步长并抑制 x.0/x.5 锚点打分（防同分簇）"""
+        from core.layer3_aesthetic import _build_dimension_prompt
+        prompt = _build_dimension_prompt(None)
+        assert "小数点后一位" in prompt
+        assert "锚点" in prompt
+
+    def test_fingerprint_deterministic(self):
+        """指纹应稳定：同配置多次计算一致，长度 16"""
+        from core.layer3_aesthetic import vlm_prompt_fingerprint
+        a, b = vlm_prompt_fingerprint(), vlm_prompt_fingerprint()
+        assert a == b and len(a) == 16
+
+    def test_fingerprint_sensitive_to_prompt_change(self, monkeypatch):
+        """prompt 模板变更 → 指纹必须变化（checkpoint 失效依据）"""
+        import core.layer3_aesthetic as l3
+        before = l3.vlm_prompt_fingerprint()
+        monkeypatch.setattr(l3, "_OUTPUT_REQ", l3._OUTPUT_REQ + "（改动）")
+        assert l3.vlm_prompt_fingerprint() != before
+
+    def test_fingerprint_sensitive_to_model_change(self, monkeypatch):
+        """模型变更 → 指纹必须变化"""
+        import config
+        import core.layer3_aesthetic as l3
+        before = l3.vlm_prompt_fingerprint()
+        monkeypatch.setattr(config, "QWEN_MODEL", "qwen-vl-other")
+        assert l3.vlm_prompt_fingerprint() != before

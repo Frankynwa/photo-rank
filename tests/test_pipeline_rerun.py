@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from config import QWEN_MODEL
+from core.layer3_aesthetic import vlm_prompt_fingerprint
 from core.models import Layer1Result, Layer3Result, Layer4Result, SimilarityCluster
 from core.pipeline import _expand_rerun_layers, run_pipeline
 
@@ -61,12 +63,13 @@ def fake_env(tmp_path, monkeypatch):
     platform_dir = out_dir / "xiaohongshu"
     platform_dir.mkdir(parents=True)
 
-    # 完整 v2 checkpoint（L1/L2/L4/L3 全部完成）
+    # 完整 v3 checkpoint（L1/L2/L4/L3 全部完成，指纹与当前配置一致 → 旧分可复用）
     phash_map = {p: f"{i:016x}" for i, p in enumerate(paths)}
     checkpoint = {
-        "version": 2,
+        "version": 3,
         "completed_layer": 4,
         "skipped_layers": [],
+        "meta": {"prompt_hash": vlm_prompt_fingerprint(), "model": QWEN_MODEL},
         "kept": [
             Layer1Result(path=p, filename=Path(p).name, sharpness=100.0, exposure=1.0, noise=0.1, overall=0.7)
             for p in paths

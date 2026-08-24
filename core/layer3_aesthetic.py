@@ -3,6 +3,7 @@ import asyncio
 import base64
 import concurrent.futures
 import gc
+import hashlib
 import io
 import json
 import logging
@@ -13,7 +14,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from config import VLM_IMAGE_MAX_SIDE, VLM_JPEG_QUALITY
+from config import VLM_IMAGE_MAX_SIDE, VLM_JPEG_QUALITY, VLM_SATURATION_RESAMPLE
 from core.models import Layer3Result
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,8 @@ _RUBRIC = """
 _OUTPUT_REQ = """
 【输出要求】
 - 先在心里完成评审流程，再简要说明打分理由（30-50 字），最后给分数。
+- 分数精确到小数点后一位（如 7.3、8.6），根据实际水平细分，
+  不要默认给 x.0/x.5 的整档分；不同照片的分数应体现差异，避免多张都落在同一锚点值。
 - hard_flaws：从以下枚举中选你实际检测到的硬伤（可多个，无则填"无硬伤"）：
   {HARD_FLAW_ENUM}
   必须输出该字段，硬伤检查不可跳过；存在任何硬伤时对应维度上限 4 分（人脸模糊除外，其仅按自然减分处理）。
@@ -186,6 +189,26 @@ def _build_dimension_prompt(face_summary: str | None) -> str:
     prompt = prompt.replace("{HARD_FLAW_ENUM}", " / ".join(_HARD_FLAW_ENUMS))
     prompt = prompt.replace("{CATEGORY_ENUM}", " / ".join(_CATEGORIES))
     return prompt
+
+
+def vlm_prompt_fingerprint() -> str:
+    """VLM 评分配置指纹：静态 prompt 模板（含硬伤/分类枚举，不含逐照片
+    注入的 FACE_INFO）+ 模型名的 sha1 前 16 位
+
+    供 checkpoint 新鲜度校验：prompt 或模型变更后旧 VLM 分与新分不再
+    可比（分数语义已变），pipeline 据此自动触发 VLM 重评，
+    防止新旧 prompt 分数静默混排（历史教训：旧 checkpoint 无
+    person_is_subject 字段被回填逻辑静默混入新规则）。
+    """
+    from config import QWEN_MODEL
+
+    tpl = "".join([
+        _PROMPT_HEADER, _FACE_SECTION, _HARD_FLAW_CHECK_FACE,
+        _HARD_FLAW_CHECK_PLAIN, _RUBRIC, _OUTPUT_REQ,
+    ])
+    tpl = tpl.replace("{HARD_FLAW_ENUM}", " / ".join(_HARD_FLAW_ENUMS))
+    tpl = tpl.replace("{CATEGORY_ENUM}", " / ".join(_CATEGORIES))
+    return hashlib.sha1(f"{QWEN_MODEL}::{tpl}".encode("utf-8")).hexdigest()[:16]
 
 
 def score_topiq(
@@ -307,8 +330,12 @@ def clamp_hard_flaws_after_normalize(results: list[Layer3Result]) -> None:
                 r.score_reason += "（人像硬伤，已钳制至 6 分上限）"
 
 
-def _decide_vlm_clamp(hard_flag: "str | bool | None", subject: bool | None, flaws: list) -> bool:
-    """人像硬伤钳制判定（L4 客观触发源 + VLM 主体裁断）
+def _decide_vlm_clamp(hard_flag: "str | bool | None", subject: bool | None, flaws: list) -> tuple[bool, str]:
+    """人像硬伤钳制判定（L4 客观触发源 + VLM 主体裁断），返回 (是否钳制, 规则路径)
+
+    规则路径供审计（clamp_source）：blink_l4（L4 检出主脸闭眼）/ blink_legacy（遗留布尔）/
+    blink_vlm（VLM 自报闭眼）/ blur_dual（模糊双证据）/ blur_fallback（subject 缺失回落旧逻辑）；
+    未钳制返回空串。
 
     L4 无法判定"脸是否主体"与墨镜/侧脸等遮挡，VLM 裁断为准：
     - subject=False（人物/人脸非主体，含背景路人/误检假脸）→ 永不钳制
@@ -318,14 +345,47 @@ def _decide_vlm_clamp(hard_flag: "str | bool | None", subject: bool | None, flaw
       回落旧逻辑钳制，保住程序化兜底
     """
     if subject is False:
-        return False  # 人物/人脸非主体：L4 人脸数据不参与钳制
+        return False, ""  # 人物/人脸非主体：L4 人脸数据不参与钳制
     vlm_blink = any("闭眼" in f for f in flaws)
     if hard_flag == "blur":
         # 清晰度触发需 VLM 像素级佐证；字段缺失时回落旧逻辑
-        return bool(any("人脸模糊" in f for f in flaws)) if subject is not None else True
+        if subject is not None:
+            return (True, "blur_dual") if any("人脸模糊" in f for f in flaws) else (False, "")
+        return True, "blur_fallback"
+    if hard_flag == "blink":
+        return True, "blink_l4"  # L4 客观检出主脸闭眼
     if hard_flag:
-        return True  # 闭眼触发（L4 客观）或遗留布尔
-    return vlm_blink  # VLM 自报闭眼（辅助信号）
+        return True, "blink_legacy"  # 遗留 truthy 布尔（旧接口兼容）
+    if vlm_blink:
+        return True, "blink_vlm"  # VLM 自报闭眼（辅助信号）
+    return False, ""
+
+
+def _is_saturated(dims: dict) -> bool:
+    """VLM 原始分饱和判定：综合分 ≥9.8，或构图/色彩/光影三项全 ≥9
+
+    实证背景：801 张历史数据中 11.1% 拿满分、最大同分簇 29 张（理由各异但
+    分数一致）——模型把 8~9 档当锚点，头部照片区分度崩坏。饱和旗标供
+    跑后体检与可选重采样（VLM_SATURATION_RESAMPLE）使用，不改分。
+    """
+    if not dims or dims.get("overall_aesthetic_score", 0) <= 0:
+        return False
+    if dims["overall_aesthetic_score"] >= 9.8:
+        return True
+    trio = (dims.get("composition_score", 0), dims.get("color_score", 0), dims.get("lighting_score", 0))
+    return all(v >= 9 for v in trio)
+
+
+def _merge_dims(first: dict, second: dict) -> dict:
+    """两次 VLM 评分取均值（饱和重采样）：分数取均值，非分数字段以首次为准"""
+    if not second:
+        return first
+    out = dict(first)
+    for k in _VLM_DIM_KEYS:
+        a, b = first.get(k), second.get(k)
+        if a is not None and b is not None:
+            out[k] = round((a + b) / 2, 1)
+    return out
 
 
 def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: "str | bool" = False) -> None:
@@ -334,21 +394,23 @@ def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: "str | bo
     hard_flag: L4 客观触发源——"blink"（主脸闭眼）/ "blur"（主脸清晰度低于阈值）/
     遗留 truthy 布尔 / False。
 
-    钳制判定规则见 _decide_vlm_clamp；本函数不修改分数（F3），仅记录 vlm_clamp
-    与理由后缀，归一化后由 clamp_hard_flaws_after_normalize 统一钳制。
+    钳制判定规则见 _decide_vlm_clamp；本函数不修改分数（F3），仅记录 vlm_clamp/
+    clamp_source 与理由后缀，归一化后由 clamp_hard_flaws_after_normalize 统一钳制。
     """
     result.composition_score = round(dims.get("composition_score", 5.0), 4)
     result.color_score = round(dims.get("color_score", 5.0), 4)
     result.lighting_score = round(dims.get("lighting_score", 5.0), 4)
     if dims.get("hard_flaws"):
         result.hard_flaws = list(dims["hard_flaws"])
+    result.vlm_saturated = _is_saturated(dims)
     if dims.get("overall_aesthetic_score", 0) > 0:
         score = round(dims["overall_aesthetic_score"], 4)
         subject = dims.get("person_is_subject")
         result.person_is_subject = subject if isinstance(subject, bool) else None
         flaws = dims.get("hard_flaws", [])
-        clamp = _decide_vlm_clamp(hard_flag, result.person_is_subject, flaws)
+        clamp, source = _decide_vlm_clamp(hard_flag, result.person_is_subject, flaws)
         result.vlm_clamp = clamp
+        result.clamp_source = source
         if clamp:
             reason = dims.get("reason", "")
             suffix = "（人像硬伤：闭眼/主脸模糊，已钳制至 6 分上限）"
@@ -386,7 +448,14 @@ def apply_vlm_dimensions(
             try:
                 face_summary = face_summaries.get(result.path) if face_summaries else None
                 hard_flag = face_hard_flags.get(result.path) if face_hard_flags else False
-                return result, _run_dimension_analysis(result.path, face_summary=face_summary), hard_flag
+                dims = _run_dimension_analysis(result.path, face_summary=face_summary)
+                if VLM_SATURATION_RESAMPLE and _is_saturated(dims):
+                    # 饱和重采样（默认关）：追加一次评分取均值，缓解锚点打分
+                    try:
+                        dims = _merge_dims(dims, _run_dimension_analysis(result.path, face_summary=face_summary))
+                    except Exception as e:
+                        logger.warning(f"饱和重采样失败 {result.filename}: {e}（采用首次评分）")
+                return result, dims, hard_flag
             except Exception as e:
                 logger.warning(f"维度分析失败 {result.filename}: {e}")
                 return result, {}, False

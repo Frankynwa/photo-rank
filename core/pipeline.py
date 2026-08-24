@@ -67,6 +67,34 @@ def _face_hard_flag(r: Layer4Result) -> str | None:
     return None
 
 
+def _report_scoring_health(aes_results: list[Layer3Result], label: str) -> None:
+    """跑后统计报警：钳制率/低分占比异常即打 warning
+
+    历史教训：53 张中 29 张被误钳制（55%，pareidolia 误检 + 二次惩罚），
+    系统静默通过，直到用户看照片才发现。加统计报警后同类 bug 分钟级可现。
+    """
+    scored = [r for r in aes_results if r.vlm_overall_score > 0]
+    if not scored:
+        return
+    clamped = sum(1 for r in scored if r.vlm_clamp)
+    low = sum(1 for r in scored if r.vlm_overall_score < 2.0)
+    clamp_rate = clamped / len(scored)
+    low_rate = low / len(scored)
+    logger.info(
+        f"[{label}] 评分健康: VLM 评分 {len(scored)} 张，钳制 {clamped} 张（{clamp_rate:.0%}），"
+        f"低分(<2) {low} 张（{low_rate:.0%}）"
+    )
+    if clamp_rate > 0.20:
+        logger.warning(
+            f"[{label}] 钳制率 {clamp_rate:.0%} 超过 20%——疑似人脸硬伤判定误触发"
+            f"（检测误检/阈值漂移），请排查 L4 数据与 person_is_subject 分布"
+        )
+    if low_rate > 0.10:
+        logger.warning(
+            f"[{label}] 低分(<2) 占比 {low_rate:.0%} 超过 10%——疑似二次惩罚或归一化异常"
+        )
+
+
 def _emit(progress_callback, event: str, **data):
     """安全调用进度回调"""
     if progress_callback:
@@ -109,6 +137,10 @@ def _compute_final_score(r, weights: dict, dim_w_sum: float, face_scores: dict, 
     - VLM 未评分（降级路径）时保留 face 权重；无脸照片权重重分配
     """
     has_face = face_scores.get(r.path, 0.0) > 0
+    if has_face and r.person_is_subject is False:
+        # VLM 裁断人物非主体（含背景路人/误检假脸）：face 权重归零，
+        # 防降级路径（VLM 未评分）被假脸的低分人脸分污染
+        has_face = False
     has_vlm = r.vlm_overall_score > 0
     w = _effective_weights(has_face, has_vlm)
     topiq10 = r.overall_score  # TOPIQ 批次归一化后 0-10
@@ -650,6 +682,7 @@ def run_pipeline(
                     result.lighting_score = 5.0
             aes_results = aes_topiq_results
             aes_results.sort(key=lambda x: x.overall_score, reverse=True)
+            _report_scoring_health(aes_results, "照片榜")
         except Exception as e:
             logger.error(f"[L3] 失败，跳过: {e}")
             aes_results = [Layer3Result(path=p, filename=Path(p).name) for p in representatives]
@@ -964,6 +997,7 @@ def run_video_ranking(
             face_hard_flags=face_hard_flags,
         )
         aes_results.sort(key=lambda x: x.overall_score, reverse=True)
+        _report_scoring_health(aes_results, "视频榜")
     except Exception as e:
         logger.error(f"[视频榜-L3] VLM 失败，降级为 TOPIQ 排序: {e}")
         aes_results = aes_topiq_results or [

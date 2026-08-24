@@ -41,6 +41,23 @@ class _FakeBlendshape:
         self.score = score
 
 
+def _make_face_landmarks():
+    """478 点假 landmark：合法五官拓扑（眼<鼻<嘴），通过 _is_plausible_face 几何校验
+
+    bbox 0.3~0.7 x 0.2~0.8（高宽比 1.5），瞳距 0.16（占 bbox 宽 40%），嘴宽 0.12。
+    """
+    lm = [_FakeLandmark(0.5, 0.5) for _ in range(478)]
+    lm[10] = _FakeLandmark(0.5, 0.2)    # 额头
+    lm[152] = _FakeLandmark(0.5, 0.8)   # 下巴
+    lm[234] = _FakeLandmark(0.3, 0.5)   # 右脸颊边
+    lm[454] = _FakeLandmark(0.7, 0.5)   # 左脸颊边
+    lm[33], lm[133] = _FakeLandmark(0.38, 0.35), _FakeLandmark(0.46, 0.35)
+    lm[362], lm[263] = _FakeLandmark(0.54, 0.35), _FakeLandmark(0.62, 0.35)
+    lm[4] = _FakeLandmark(0.5, 0.5)     # 鼻尖
+    lm[61], lm[291] = _FakeLandmark(0.44, 0.65), _FakeLandmark(0.56, 0.65)
+    return lm
+
+
 def _build_mock_detection(
     face_count: int = 0,
     blink: bool = False,
@@ -67,12 +84,8 @@ def _build_mock_detection(
         result.face_landmarks = []
         result.face_blendshapes = []
     else:
-        # 为每张人脸生成 landmarks（归一化坐标 0.3~0.7 模拟面部区域）
-        landmarks = [
-            _FakeLandmark(0.3, 0.2), _FakeLandmark(0.7, 0.2),
-            _FakeLandmark(0.3, 0.8), _FakeLandmark(0.7, 0.8),
-            _FakeLandmark(0.5, 0.5),
-        ]
+        # 为每张人脸生成 478 点 landmark（合法拓扑，通过假脸几何校验）
+        landmarks = _make_face_landmarks()
         face_landmarks = [landmarks for _ in range(face_count)]
 
         # blendshapes

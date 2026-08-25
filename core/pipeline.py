@@ -600,6 +600,13 @@ def run_pipeline(
         merged_aes = [old_aes[p] for p in representatives if p in old_aes]
         merged_aes += [r for r in aes_topiq_results if r.path in rep_set and r.path not in old_aes]
         aes_topiq_results = merged_aes
+        # TOPIQ 全量统一重归一化：新/旧分可能来自不同子批次的 p5-p95 参照系，
+        # 用原始分（topiq_raw_score）幂等重算统一标尺；旧记录缺 raw（旧 checkpoint）则保持原行为
+        if aes_topiq_results and all(
+            r.topiq_raw_score > 0 for r in aes_topiq_results if not r.error and r.overall_score > 0
+        ):
+            from core.layer3_aesthetic import _normalize_batch_scores
+            _normalize_batch_scores(aes_topiq_results)
         logger.info(
             f"[增量] 合并评分: 人脸 {len(face_results)} 张（新评 {len(scoring_targets)} 张），"
             f"TOPIQ {len(aes_topiq_results)} 张"
@@ -648,8 +655,14 @@ def run_pipeline(
             r.device = nr.device
             replaced += 1
         aes_results.sort(key=lambda x: x.overall_score, reverse=True)
+        # TOPIQ 全量统一重归一化（同增量合并路径）：新/旧分参照系可能不同，raw 齐备才重算
+        if all(r.topiq_raw_score > 0 for r in aes_results if not r.error and r.overall_score > 0):
+            from core.layer3_aesthetic import _normalize_batch_scores
+            _normalize_batch_scores(aes_results)
+            aes_results.sort(key=lambda x: x.overall_score, reverse=True)
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
         logger.info(f"[L3] TOPIQ 重跑完成（替换 {replaced}/{len(aes_results)} 张），VLM 分复用 checkpoint")
+        _report_scoring_health(aes_results, "照片榜(TOPIQ重跑)")
         _save_layer_checkpoint(output_dir, 4, {
             "aes_results": [r.model_dump() for r in aes_results],
             "skipped_layers": skipped_layers,
@@ -657,6 +670,9 @@ def run_pipeline(
     elif not need_vlm:
         aes_results = [Layer3Result(**r) for r in checkpoint["aes_results"]]
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
+        # 恢复路径同样补排序 + 健康报警，与 VLM 重评分支对齐（杜绝静默通过）
+        aes_results.sort(key=lambda x: x.overall_score, reverse=True)
+        _report_scoring_health(aes_results, "照片榜(checkpoint恢复)")
         logger.info(f"[L3] 从 checkpoint 恢复: {len(aes_results)} 张")
     else:
         _emit(progress_callback, "layer_start", layer=4, layer_name="审美评分")
@@ -718,12 +734,9 @@ def run_pipeline(
                         logger.warning(f"维度分析失败 {r.filename}: {e}")
                         dims = {}
                     _apply_dims_to_result(r, dims, hard_flag=hflag)
-                # 与 apply_vlm_dimensions 一致的归一化 + 硬伤重新钳制
-                if incremental:
-                    # 增量：仅对新代表的 VLM 分做批次归一化（旧代表沿用 checkpoint 归一化值）
-                    _normalize_vlm_batch([r for r in aes_topiq_results if r.path in set(scoring_targets)])
-                else:
-                    _normalize_vlm_batch(aes_topiq_results)
+                # 全量统一重归一化：增量时旧/新 VLM 分可能来自不同批次的 p5-p95 参照系，
+                # 基于 vlm_raw_score（记录内保留的归一化前原始分）幂等重算，消除跨批次不可比
+                _normalize_vlm_batch(aes_topiq_results)
                 # checkpoint 恢复的旧 VLM 记录无 vlm_clamp 字段（默认 False），
                 # 用 L4 触发源 + 已存 person_is_subject/hard_flaws 回填，再统一钳制
                 for r in aes_topiq_results:
@@ -851,6 +864,9 @@ def run_pipeline(
             "final_score": score_map[r.path],
             "category": r.category,
             "vlm_overall_score": r.vlm_overall_score,
+            # 归一化前原始分（增量全量重归一化的参照，取证用）
+            "vlm_raw_score": r.vlm_raw_score,
+            "topiq_raw_score": r.topiq_raw_score,
             "composition_score": r.composition_score,
             "color_score": r.color_score,
             "lighting_score": r.lighting_score,
@@ -1178,6 +1194,18 @@ def run_video_ranking(
     ]
     with open(output_dir / "video_full_ranking.json", "w", encoding="utf-8") as f:
         json.dump(full, f, ensure_ascii=False, indent=2)
+
+    # 跑批元信息（与照片榜 run_meta.json 同源）：视频榜产物同样可追溯 prompt/模型版本
+    from core.layer3_aesthetic import vlm_prompt_fingerprint
+    video_run_meta = {
+        "prompt_hash": vlm_prompt_fingerprint(),
+        "model": QWEN_MODEL,
+        "platform": platform,
+        "frame_count": len(full),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(output_dir / "run_meta.json", "w", encoding="utf-8") as f:
+        json.dump(video_run_meta, f, ensure_ascii=False, indent=2)
 
     logger.info(
         f"[视频榜] 完成: 候选{len(aes_results)} → 入选{len(video_results)}"

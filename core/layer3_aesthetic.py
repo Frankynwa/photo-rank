@@ -418,6 +418,7 @@ def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: "str | bo
         else:
             result.score_reason = dims.get("reason", "")
         result.vlm_overall_score = score
+        result.vlm_raw_score = score  # 保留归一化前原始分，供增量全量重归一化幂等重算
     if dims.get("category"):
         result.category = dims["category"]
 
@@ -490,12 +491,18 @@ def _normalize_vlm_batch(results: list[Layer3Result]) -> None:
     """VLM 综合审美分批次归一化（p5-p95 拉伸到 0-10），防分数膨胀/缺乏区分度
 
     - 仅对真实 VLM 评分（vlm_overall_score > 0）的照片生效
+    - 基于 vlm_raw_score（归一化前原始分）计算，重复调用幂等；
+      旧记录无 raw 时回落当前值（旧 checkpoint 兼容）
     - 少于 2 张或分数分布集中时保持不变（避免噪声放大，与 TOPIQ 归一化一致）
     """
-    valid = [r for r in results if r.vlm_overall_score > 0]
+    valid = [r for r in results if r.vlm_overall_score > 0 or r.vlm_raw_score > 0]
+    for r in valid:
+        if r.vlm_raw_score <= 0:
+            r.vlm_raw_score = r.vlm_overall_score  # 首次归一化前固化原始分
+    valid = [r for r in valid if r.vlm_raw_score > 0]  # 未评分记录（双 0）排除在外
     if len(valid) < 2:
         return
-    vals = sorted(r.vlm_overall_score for r in valid)
+    vals = sorted(r.vlm_raw_score for r in valid)
     n = len(vals)
     lo = vals[max(0, int(n * 0.05) - 1)]
     hi = vals[min(n - 1, int(n * 0.95) - 1)]
@@ -503,7 +510,7 @@ def _normalize_vlm_batch(results: list[Layer3Result]) -> None:
     if span < 0.5:
         return
     for r in valid:
-        norm = max(0.0, min(1.0, (r.vlm_overall_score - lo) / span))
+        norm = max(0.0, min(1.0, (r.vlm_raw_score - lo) / span))
         # 正下限 0.01：避免最低分归一化到精确 0.0，被全链路 "> 0 = 已评分"
         # 判定误判为 VLM 未评分（导致 face 权重不归零、q_vlm 错误回退 TOPIQ）
         r.vlm_overall_score = round(max(norm, 0.01) * 10, 4)
@@ -614,12 +621,18 @@ def _parse_dimension_json(text: str) -> dict:
 def _normalize_batch_scores(results: list[Layer3Result]) -> None:
     """批次归一化 TOPIQ 综合分（p5-p95 拉伸到 0-10），拉开区分度
 
+    - 基于 topiq_raw_score（归一化前原始分）计算，重复调用幂等；
+      旧记录无 raw 时回落当前值（旧 checkpoint 兼容）
     - 少于 2 张或分数分布过于集中时保持不变（避免噪声放大）
     """
-    valid = [r for r in results if not r.error and r.overall_score > 0]
+    valid = [r for r in results if not r.error and (r.overall_score > 0 or r.topiq_raw_score > 0)]
+    for r in valid:
+        if r.topiq_raw_score <= 0:
+            r.topiq_raw_score = r.overall_score  # 首次归一化前固化原始分
+    valid = [r for r in valid if r.topiq_raw_score > 0]  # 归一化到 0.0 的记录凭 raw 保留在批次内（幂等）
     if len(valid) < 2:
         return
-    vals = sorted(r.overall_score for r in valid)
+    vals = sorted(r.topiq_raw_score for r in valid)
     n = len(vals)
     lo = vals[max(0, int(n * 0.05) - 1)]
     hi = vals[min(n - 1, int(n * 0.95) - 1)]
@@ -627,7 +640,7 @@ def _normalize_batch_scores(results: list[Layer3Result]) -> None:
     if span < 0.5:
         return
     for r in valid:
-        norm = max(0.0, min(1.0, (r.overall_score - lo) / span))
+        norm = max(0.0, min(1.0, (r.topiq_raw_score - lo) / span))
         r.overall_score = round(norm * 10, 4)
 
 

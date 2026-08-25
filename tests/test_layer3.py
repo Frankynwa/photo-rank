@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from core.models import Layer3Result
@@ -285,6 +286,70 @@ class TestNormalizeBatchScores:
         ]
         _normalize_batch_scores(results)
         assert all(r.overall_score == 6.0 for r in results)
+
+
+class TestRawScorePreservation:
+    """归一化前原始分保留（topiq_raw_score/vlm_raw_score）：增量全量重归一化的幂等基础"""
+
+    def test_topiq_raw_captured_before_normalize(self):
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=s)
+            for i, s in enumerate([5.0, 6.0, 7.0, 8.0, 9.0], 1)
+        ]
+        _normalize_batch_scores(results)
+        assert [r.topiq_raw_score for r in results] == [5.0, 6.0, 7.0, 8.0, 9.0]
+
+    def test_topiq_normalize_idempotent_via_raw(self):
+        """重复归一化基于 raw 重算，结果不变（幂等）"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=s)
+            for i, s in enumerate([5.0, 6.0, 7.0, 8.0, 9.0], 1)
+        ]
+        _normalize_batch_scores(results)
+        once = [r.overall_score for r in results]
+        _normalize_batch_scores(results)  # 第二次：若基于已归一化值重算会失真
+        assert [r.overall_score for r in results] == once
+
+    def test_vlm_raw_captured_and_idempotent(self):
+        from core.layer3_aesthetic import _normalize_vlm_batch
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", vlm_overall_score=s)
+            for i, s in enumerate([6.0, 7.0, 8.0, 9.0, 9.5], 1)
+        ]
+        _normalize_vlm_batch(results)
+        assert [r.vlm_raw_score for r in results] == [6.0, 7.0, 8.0, 9.0, 9.5]
+        once = [r.vlm_overall_score for r in results]
+        _normalize_vlm_batch(results)
+        assert [r.vlm_overall_score for r in results] == once
+
+    def test_incremental_unified_rescale(self):
+        """模拟增量：旧批次已归一化（raw 保留）+ 新批次 raw → 全量重算统一标尺"""
+        from core.layer3_aesthetic import _normalize_vlm_batch
+        from core.models import Layer3Result
+
+        # 旧 3 张：首次批次（raw 7/8.5/9.5）归一化后为 0.1/10/10，raw 已固化
+        old = [
+            Layer3Result(path=f"/old/{i}", filename=f"{i}.jpg",
+                         vlm_overall_score=norm, vlm_raw_score=raw)
+            for i, (norm, raw) in enumerate([(0.1, 7.0), (10.0, 8.5), (10.0, 9.5)], 1)
+        ]
+        # 新 1 张：新子批次单独评分 raw=8.0（尚未归一化）
+        new = Layer3Result(path="/new/1", filename="n.jpg", vlm_overall_score=8.0, vlm_raw_score=8.0)
+        batch = old + [new]
+        _normalize_vlm_batch(batch)
+        # 全量 raw [7, 8, 8.5, 9.5]：lo=7, hi=vals[2]=8.5，span=1.5
+        by_path = {r.path: r.vlm_overall_score for r in batch}
+        assert by_path["/old/1"] == pytest.approx(0.1)  # 最低分正下限
+        assert by_path["/new/1"] == pytest.approx(round((8.0 - 7.0) / 1.5 * 10, 4)), "新张应落在统一标尺的正确位置"
+        assert by_path["/old/2"] == 10.0 and by_path["/old/3"] == 10.0  # ≥hi 封顶
 
 
 # ---------------------------------------------------------------------------

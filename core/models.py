@@ -40,11 +40,13 @@ class Layer3Result(BaseModel):
     aesthetic_score: float = 0.0
     technical_score: float = 0.0
     overall_score: float = 0.0
+    topiq_raw_score: float = 0.0  # TOPIQ 归一化前原始分（增量全量重归一化的参照，0=未记录）
     final_score: float = 0.0
     composition_score: float = 0
     color_score: float = 0
     lighting_score: float = 0
     vlm_overall_score: float = 0.0  # VLM 综合审美分（>0 表示真实评分，否则为未评分）
+    vlm_raw_score: float = 0.0  # VLM 归一化前原始分（增量全量重归一化的参照，0=未记录）
     score_reason: str = ""  # VLM 评分理由
     hard_flaws: list[str] = []  # VLM 自报硬伤列表（闭眼/模糊/过曝等，用于钳制与诊断）
     category: str = ""  # VLM 分类标签（风景/建筑/人像/人文纪实/美食/动物/夜景/其他）

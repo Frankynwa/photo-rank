@@ -6,6 +6,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
+from core.layer3_aesthetic import vlm_prompt_fingerprint
 from core.models import Layer3Result
 from core.pipeline import _allocate_quotas, run_video_ranking
 
@@ -129,6 +130,12 @@ class TestRunVideoRanking:
         assert all(s["filename"].startswith("v") for s in saved), "展示文件名应为 vNN_ 序号名"
         for s in saved:
             assert (out / s["filename"]).exists(), "入选帧应复制到 output 目录"
+
+        # 跑批元信息：视频榜产物同样可追溯 prompt/模型版本（与照片榜 run_meta.json 同源）
+        meta = json.loads((out / "run_meta.json").read_text(encoding="utf-8"))
+        assert meta["prompt_hash"] == vlm_prompt_fingerprint()
+        assert meta["frame_count"] == 4
+        assert meta["platform"] == "test_platform"
 
     def test_no_frames_returns_empty(self, tmp_path: Path):
         """无视频帧目录时应安全返回空结果"""

@@ -211,14 +211,17 @@ class TestIncrementalWithNewPhoto:
         # VLM 只对新代表
         assert calls["vlm"] == [new_path], "VLM 应只评分新增代表"
 
-        # 结果合并：旧 3 张 VLM 分保留 8.0，新照片 VLM 6.2
+        # 结果合并：VLM 全量统一重归一化（raw 8.0×3 + 6.2 → p5-p95 拉伸）：
+        # 旧 8.0 → 10.0，新 6.2 → 正下限 0.1；原始分经 vlm_raw_score 保留
         full = json.loads((env["platform_dir"] / "full_ranking.json").read_text(encoding="utf-8"))
         by_path = {r["path"]: r for r in full}
         assert len(full) == 4
         for p in env["paths"]:
-            assert by_path[p]["vlm_overall_score"] == 8.0, f"{Path(p).name} VLM 分应复用"
-        assert by_path[new_path]["vlm_overall_score"] == pytest.approx(6.2), "新照片应有 VLM 分"
-        # 新照片 TOPIQ 分 7.0
+            assert by_path[p]["vlm_overall_score"] == 10.0, f"{Path(p).name} 应统一重归一化"
+            assert by_path[p]["vlm_raw_score"] == 8.0, "归一化前原始分应保留"
+        assert by_path[new_path]["vlm_raw_score"] == pytest.approx(6.2), "新照片原始分应保留"
+        assert by_path[new_path]["vlm_overall_score"] == pytest.approx(0.1), "新照片处统一标尺下限"
+        # 新照片 TOPIQ 分 7.0（旧记录缺 raw → TOPIQ 重归一化不触发，保持原值）
         assert by_path[new_path]["overall_score"] == 7.0
 
         # checkpoint 已更新：新照片进入，下次不再是"新增"

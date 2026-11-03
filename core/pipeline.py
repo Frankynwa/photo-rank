@@ -285,25 +285,16 @@ def run_pipeline(
         skip_l1: 为 True 时跳过 L1 淘汰（模糊/曝光不拦截），全部照片进入后续层
             （仍计算 sharpness/pHash 供聚类与多样性使用）；强制全量重跑。
     """
-    from core.layer1_objective import batch_analyze_with_phash
-    from core.layer2_similarity import cluster_photos
-    from core.layer3_aesthetic import score_topiq, vlm_prompt_fingerprint
-    from core.layer4_face import analyze_faces, to_face_prompt_summary
+    from core.layer3_aesthetic import vlm_prompt_fingerprint
 
     photos_dir = Path(photos_dir or PHOTOS_DIR)
     output_dir = OUTPUT_DIR / platform
 
     # 收集所有照片
-    extensions = ["*.jpg", "*.jpeg", "*.png", "*.heic", "*.HEIC", "*.JPG", "*.PNG"]
-    photos = []
-    for ext in extensions:
-        photos.extend(photos_dir.glob(ext))
-
+    photos = _scan_photos(photos_dir)
     if not photos:
         logger.warning(f"未找到照片: {photos_dir}")
         return {"error": "未找到照片", "total": 0}
-
-    photos = sorted(set(photos), key=lambda p: p.name)
 
     platform_config = PLATFORMS.get(platform, PLATFORMS["xiaohongshu"])
 
@@ -315,6 +306,96 @@ def run_pipeline(
         clean_image_cache()
     except Exception as e:
         logger.debug(f"解码缓存清理失败（不影响流水线）: {e}")
+
+    # ── 运行模式解析（checkpoint 恢复 / 增量重跑 / 新增照片增量）──
+    prompt_hash = vlm_prompt_fingerprint()
+    checkpoint, rerun, incremental, incremental_new = _resolve_run_mode(
+        output_dir, force, rerun_layers, skip_l1, incremental, photos, prompt_hash,
+    )
+
+    # 仅在全新启动时清理输出目录
+    if not checkpoint:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for old in output_dir.glob("*"):
+            if old.is_file() and old.name != "checkpoint.json":
+                old.unlink()
+
+    _emit(progress_callback, "layer_start", layer=0, layer_name="开始", total=len(photos))
+
+    skipped_layers: list[str] = []
+
+    # ── Layer 1: 客观指标 ──
+    kept, rejected, phash_map, skipped_layers = _stage_l1(
+        photos, output_dir, checkpoint, rerun, incremental, incremental_new,
+        skip_l1, progress_callback, skipped_layers,
+    )
+
+    # 建立 Layer 1 客观分映射（0-1 范围）
+    l1_scores = {r.path: r.overall for r in kept}
+
+    # ── Layer 2: 相似聚类 ──
+    clusters, representatives, merged, skipped_layers = _stage_l2(
+        kept, phash_map, output_dir, checkpoint, rerun, incremental,
+        progress_callback, skipped_layers,
+    )
+
+    # ── Layer 4 + Layer 3-TOPIQ：层间并发 + VLM 图片级流水 ──
+    # L4 分析完一张立即发起该张的 VLM API 调用（与 TOPIQ 推理并行），
+    # 消除"等全部 L4 完成才启动 VLM"的空等（VLM 是网络 IO 最慢环节，提前启动收益最大）
+    # 增量重跑：L4 / TOPIQ 可从 checkpoint 独立恢复（rerun_layers 指定重跑部分）
+    vlm_tasks: list[tuple[str, object, str | None]] = []  # (path, VLM future, hard_flag)
+    api_key = os.environ.get("QWEN_API_KEY", "")
+    need_l4, need_topiq, scoring_targets = _plan_scoring(checkpoint, rerun, incremental, representatives)
+    face_results, aes_topiq_results, skipped_layers = _stage_l4_topiq(
+        checkpoint, representatives, scoring_targets, need_l4, need_topiq,
+        api_key, output_dir, progress_callback, skipped_layers, vlm_tasks,
+    )
+
+    # 增量模式：合并 checkpoint 中旧代表的评分 + 本轮新代表的评分
+    face_results, aes_topiq_results = _merge_incremental(
+        incremental, checkpoint, representatives, scoring_targets,
+        face_results, aes_topiq_results, output_dir, skipped_layers,
+    )
+
+    # 派生 L4 产物：融合分映射 + 人像硬伤触发源
+    face_scores, face_hard_flags = _derive_face_maps(face_results)
+
+    # ── Layer 3: 审美评分（TOPIQ 已与 L4 并发完成，VLM API 已在 L4 回调阶段逐张发起）──
+    aes_results, skipped_layers = _stage_vlm(
+        checkpoint, rerun, incremental, scoring_targets, need_topiq,
+        aes_topiq_results, representatives, face_results, face_hard_flags,
+        vlm_tasks, api_key, output_dir, progress_callback, skipped_layers,
+    )
+
+    # ── 融合评分：VLM 多维审美 + TOPIQ + 人脸 + 客观指标统一加权 ──
+    score_map, top_photos, top_n, weights, dim_w_sum = _fuse_and_rank(
+        aes_results, phash_map, face_scores, l1_scores, platform_config,
+    )
+
+    # ── 保存结果并汇总 ──
+    return _save_outputs(
+        output_dir, platform, prompt_hash, photos, rejected, merged,
+        top_n, skipped_layers, aes_results, top_photos, score_map, weights, dim_w_sum,
+    )
+
+
+def _scan_photos(photos_dir: Path):
+    """收集照片目录中的候选照片（按文件名排序去重）"""
+    extensions = ["*.jpg", "*.jpeg", "*.png", "*.heic", "*.HEIC", "*.JPG", "*.PNG"]
+    photos: list[Path] = []
+    for ext in extensions:
+        photos.extend(photos_dir.glob(ext))
+    return sorted(set(photos), key=lambda p: p.name)
+
+
+
+def _resolve_run_mode(output_dir: Path, force: bool, rerun_layers: list[str] | None,
+    skip_l1: bool, incremental: bool, photos: list[Path], prompt_hash: str):
+    """解析本轮运行模式：checkpoint 恢复 / 增量重跑 / 新增照片增量 / 跳过 L1
+
+    集中处理模式互斥与依赖传播（上游层重跑→下游连带、VLM 指纹变更→强制重评）。
+    返回 (checkpoint, rerun, incremental, incremental_new)。"""
+    from core.layer3_aesthetic import vlm_prompt_fingerprint
 
     # ── 检查 checkpoint ──
     # 版本化：v2 的 completed_layer 为步骤编号（1=L1, 2=L2, 3=L4, 4=L3，L4 前置）。
@@ -387,16 +468,16 @@ def run_pipeline(
             else:
                 checkpoint = None
 
-    # 仅在全新启动时清理输出目录
-    if not checkpoint:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        for old in output_dir.glob("*"):
-            if old.is_file() and old.name != "checkpoint.json":
-                old.unlink()
+    return checkpoint, rerun, incremental, incremental_new
 
-    _emit(progress_callback, "layer_start", layer=0, layer_name="开始", total=len(photos))
 
-    skipped_layers: list[str] = []
+def _stage_l1(photos: list[Path], output_dir: Path, checkpoint: dict | None,
+    rerun: set, incremental: bool, incremental_new: list[Path],
+    skip_l1: bool, progress_callback, skipped_layers: list[str]):
+    """Layer 1 客观指标：checkpoint 恢复 / 增量补跑 / 全量重跑
+
+    返回 (kept, rejected, phash_map, skipped_layers)。"""
+    from core.layer1_objective import batch_analyze_with_phash
 
     # ── Layer 1: 客观指标 ──
     if checkpoint and checkpoint["completed_layer"] >= 1 and "l1" not in rerun:
@@ -462,8 +543,16 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
-    # 建立 Layer 1 客观分映射（0-1 范围）
-    l1_scores = {r.path: r.overall for r in kept}
+    return kept, rejected, phash_map, skipped_layers
+
+
+def _stage_l2(kept: list[Layer1Result], phash_map: dict, output_dir: Path,
+    checkpoint: dict | None, rerun: set, incremental: bool,
+    progress_callback, skipped_layers: list[str]):
+    """Layer 2 相似聚类：checkpoint 恢复 / 增量重聚类 / 全量聚类
+
+    返回 (clusters, representatives, merged, skipped_layers)。"""
+    from core.layer2_similarity import cluster_photos
 
     # ── Layer 2: 相似聚类 ──
     if checkpoint and checkpoint["completed_layer"] >= 2 and "l2" not in rerun and not incremental:
@@ -487,6 +576,7 @@ def run_pipeline(
             logger.info(f"[L2] 聚类: {len(clusters)} 组, 合并: {merged}")
         except Exception as e:
             logger.error(f"[L2] 失败，跳过: {e}")
+            clusters = []  # 降级：无聚类，全部保留为独立代表（修复 except 后 clusters 未定义导致 checkpoint 落盘 UnboundLocalError）
             representatives = [r.path for r in kept]
             merged = 0
             skipped_layers.append("Layer 2")
@@ -496,12 +586,13 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
-    # ── Layer 4 + Layer 3-TOPIQ：层间并发 + VLM 图片级流水 ──
-    # L4 分析完一张立即发起该张的 VLM API 调用（与 TOPIQ 推理并行），
-    # 消除"等全部 L4 完成才启动 VLM"的空等（VLM 是网络 IO 最慢环节，提前启动收益最大）
-    # 增量重跑：L4 / TOPIQ 可从 checkpoint 独立恢复（rerun_layers 指定重跑部分）
-    vlm_tasks: list[tuple[str, object, str | None]] = []  # (path, VLM future, hard_flag)
-    api_key = os.environ.get("QWEN_API_KEY", "")
+    return clusters, representatives, merged, skipped_layers
+
+
+def _plan_scoring(checkpoint: dict | None, rerun: set, incremental: bool, representatives: list[str]):
+    """计算 L4/TOPIQ 本轮是否需重跑及评分目标集合
+
+    返回 (need_l4, need_topiq, scoring_targets)。"""
     l4_ckpt_ok = bool(checkpoint and checkpoint["completed_layer"] >= 3 and checkpoint.get("face_results"))
     topiq_ckpt_ok = bool(checkpoint and checkpoint["completed_layer"] >= 4 and checkpoint.get("aes_results"))
     rerun_l4 = "l4" in rerun
@@ -520,6 +611,18 @@ def run_pipeline(
             f"[增量] 代表 {len(representatives)} 张，需评分 {len(scoring_targets)} 张"
             f"（其余从 checkpoint 复用）"
         )
+
+    return need_l4, need_topiq, scoring_targets
+
+
+def _stage_l4_topiq(checkpoint: dict | None, representatives: list[str], scoring_targets: list[str],
+    need_l4: bool, need_topiq: bool, api_key: str, output_dir: Path,
+    progress_callback, skipped_layers: list[str], vlm_tasks: list):
+    """Layer 4 人脸 + Layer 3-TOPIQ 并发执行（L4 逐张回调预发 VLM 任务）
+
+    返回 (face_results, aes_topiq_results, skipped_layers)。"""
+    from core.layer3_aesthetic import score_topiq
+    from core.layer4_face import analyze_faces, to_face_prompt_summary
 
     if not need_l4 and not need_topiq:
         face_results = [Layer4Result(**r) for r in checkpoint["face_results"]]
@@ -589,6 +692,15 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
+    return face_results, aes_topiq_results, skipped_layers
+
+
+def _merge_incremental(incremental: bool, checkpoint: dict | None, representatives: list[str], scoring_targets: list[str],
+    face_results: list[Layer4Result], aes_topiq_results: list[Layer3Result],
+    output_dir: Path, skipped_layers: list[str]):
+    """增量模式合并：checkpoint 旧代表评分 + 本轮新代表评分（TOPIQ 统一重归一化）
+
+    非增量模式原样返回。返回 (face_results, aes_topiq_results)。"""
     # 增量模式：合并 checkpoint 中旧代表的评分 + 本轮新代表的评分
     if incremental:
         old_face = {r["path"]: Layer4Result(**r) for r in checkpoint.get("face_results", [])}
@@ -616,6 +728,13 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
+    return face_results, aes_topiq_results
+
+
+def _derive_face_maps(face_results: list[Layer4Result]):
+    """派生 L4 产物：融合分映射 + 人像硬伤触发源（VLM 注入文案已在回调中生成）
+
+    返回 (face_scores, face_hard_flags)。"""
     # 派生 L4 产物：融合分映射（VLM prompt 注入文案已在图片级流水回调中逐张生成）
     face_scores = {r.path: r.overall_face_score for r in face_results}
     # 降级兜底：多人环境场景（≥6 张脸且主脸占比 < 10%）判定人脸为环境元素，不参与加分
@@ -629,6 +748,19 @@ def run_pipeline(
     # 避免远景路人/正常拍摄的人像（人脸小、clarity 天然偏低）被误钳制到 6 分
     # （实测 0.25 阈值致 53 张含人照片几乎全部触发钳制，VLM 好分被归一化压至 ~2.6）
     face_hard_flags = {r.path: _face_hard_flag(r) for r in face_results}
+
+    return face_scores, face_hard_flags
+
+
+def _stage_vlm(checkpoint: dict | None, rerun: set, incremental: bool, scoring_targets: list[str],
+    need_topiq: bool, aes_topiq_results: list[Layer3Result], representatives: list[str],
+    face_results: list[Layer4Result], face_hard_flags: dict, vlm_tasks: list,
+    api_key: str, output_dir: Path, progress_callback, skipped_layers: list[str]):
+    """Layer 3 审美评分：TOPIQ 重跑复用 / checkpoint 恢复 / 全量 VLM 评分（三分支）
+
+    返回 (aes_results, skipped_layers)。"""
+    from core.layer3_aesthetic import score_topiq
+    from core.layer4_face import to_face_prompt_summary
 
     # ── Layer 3: 审美评分（TOPIQ 已与 L4 并发完成，VLM API 已在 L4 回调阶段逐张发起）──
     rerun_vlm = "vlm" in rerun
@@ -769,6 +901,14 @@ def run_pipeline(
             "skipped_layers": skipped_layers,
         })
 
+    return aes_results, skipped_layers
+
+
+def _fuse_and_rank(aes_results: list[Layer3Result], phash_map: dict, face_scores: dict,
+    l1_scores: dict, platform_config: dict):
+    """融合评分：VLM 多维审美 + TOPIQ + 人脸 + 客观指标统一加权 + 多样性惩罚
+
+    返回 (score_map, top_photos, top_n, weights, dim_w_sum)。"""
     # ── 融合评分：VLM 多维审美 + TOPIQ + 人脸 + 客观指标统一加权 ──
     # 说明：VLM 评分失败/未配置 API 时，q_vlm 回退为 TOPIQ 分，保证仍可排序。
     weights = platform_config.get("weights", {
@@ -830,6 +970,14 @@ def run_pipeline(
         f"人脸{weights.get('face', 0.15)}"
     )
 
+    return score_map, top_photos, top_n, weights, dim_w_sum
+
+
+def _save_outputs(output_dir: Path, platform: str, prompt_hash: str, photos: list[Path],
+    rejected: list, merged: int, top_n: int, skipped_layers: list[str],
+    aes_results: list[Layer3Result], top_photos: list[Layer3Result],
+    score_map: dict[str, float], weights: dict, dim_w_sum: float):
+    """保存榜单产物（ranking/full_ranking/run_meta + 展示照片复制）并汇总"""
     # ── 保存结果 ──
     output_dir.mkdir(parents=True, exist_ok=True)
 

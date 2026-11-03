@@ -14,3 +14,4 @@ ignore = ["E501"]  # 允许超长行（已有代码风格）
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+timeout = 300  # pytest-timeout：单测挂死时红牌罚下，不许无限等（本地曾因真模型联网下载卡死）

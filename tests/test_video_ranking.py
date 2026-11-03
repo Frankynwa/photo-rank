@@ -102,6 +102,7 @@ class TestRunVideoRanking:
         )
 
         with patch("core.layer3_aesthetic.apply_vlm_dimensions", side_effect=_fake_vlm), \
+                patch("core.layer3_aesthetic.score_topiq", side_effect=_fake_topiq), \
                 patch("core.layer4_face.analyze_faces", side_effect=_no_faces), \
                 patch("core.layer4_face.to_face_prompt_summary", return_value=""):
             summary = run_video_ranking(

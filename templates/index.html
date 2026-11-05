@@ -403,6 +403,34 @@
             font-size: 11px;
             font-weight: 500;
         }
+        /* 三桶分级徽章：精选 / 可用 / 淘汰 */
+        .photo-card .bucket-badge {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            backdrop-filter: blur(6px);
+            border: 1px solid transparent;
+        }
+        .photo-card .bucket-badge.select {
+            background: rgba(16, 185, 129, 0.92);
+            color: #04231b;
+            border-color: rgba(16, 185, 129, 0.55);
+        }
+        .photo-card .bucket-badge.maybe {
+            background: rgba(245, 158, 11, 0.9);
+            color: #241703;
+            border-color: rgba(245, 158, 11, 0.5);
+        }
+        .photo-card .bucket-badge.reject {
+            background: rgba(239, 68, 68, 0.9);
+            color: #2a0909;
+            border-color: rgba(239, 68, 68, 0.5);
+        }
 
         /* ── Modal ── */
         .modal {
@@ -624,6 +652,9 @@
         let results = [];
         let videoResults = [];
         let activeTab = 'photos';
+
+        // 三桶分级文案（后端 bucket 字段：select/maybe/reject）
+        const BUCKET_LABELS = { select: '精选', maybe: '可用', reject: '淘汰' };
 
         // ── WebSocket（含自动重连） ──
         let ws = null;
@@ -883,9 +914,15 @@ async function uploadVideo(file) {
                 const sourceTag = isVideo && result.source_video
                     ? `<div class="video-source">🎬 ${result.source_video} · ${formatTime(result.timestamp)}</div>`
                     : '';
+                // 三桶徽章：视频榜无分桶（bucket 为空）则不渲染
+                const bucketLabel = BUCKET_LABELS[result.bucket];
+                const bucketBadge = bucketLabel
+                    ? `<div class="bucket-badge ${result.bucket}">${bucketLabel}</div>`
+                    : '';
 
                 card.innerHTML = `
                     <div class="rank">${index + 1}</div>
+                    ${bucketBadge}
                     <img src="${imgBase}/${result.filename}" alt="${result.filename}">
                     <div class="info">
                         ${sourceTag}
@@ -929,6 +966,14 @@ async function uploadVideo(file) {
                 ? `<h3>🎬 来源视频</h3><p>${result.source_video} · 时间 ${formatTime(result.timestamp)}</p>`
                 : '';
 
+            // 三桶分级：桶名 + 批次百分位（percentile 为 0 时视为无数据，不展示）
+            const bucketLabel = BUCKET_LABELS[result.bucket];
+            const bucketInfo = bucketLabel
+                ? `<h3>🎯 分级</h3><p>${bucketLabel}`
+                  + (result.percentile ? ` — 超过 ${result.percentile}% 的照片` : '')
+                  + `</p>`
+                : '';
+
             modalAnalysis.innerHTML = `
                 ${sourceInfo}
                 <h3>📊 评分</h3>
@@ -936,6 +981,8 @@ async function uploadVideo(file) {
 
                 <h3>🏷️ 分类</h3>
                 <p>${result.category || '未分类'}</p>
+
+                ${bucketInfo}
             `;
 
             modal.classList.add('show');
@@ -1071,8 +1118,10 @@ async function uploadVideo(file) {
             document.getElementById('layerDetail').textContent = data.message || '';
         }
 
-        // 初始化
-        loadPhotos();
+        // 初始化：先拉上传列表，再拉已有结果
+        // （此前只调 loadPhotos，刷新页面后即使磁盘上有现成榜单也不展示，
+        //   必须等一次手动分析才能看到结果态）
+        loadPhotos().then(() => loadResults());
     </script>
 </body>
 </html>

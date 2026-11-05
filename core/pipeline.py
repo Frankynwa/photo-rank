@@ -2,7 +2,9 @@
 import json
 import logging
 import os
+import re
 import shutil
+from bisect import bisect_left as _bisect_left, bisect_right as _bisect_right
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +12,13 @@ from pathlib import Path
 import imagehash
 
 from config import (
+    BUCKET_REJECT_FLOOR,
+    BUCKET_REJECT_PERCENTILE,
+    BUCKET_SELECT_FLOOR,
+    BUCKET_SELECT_PERCENTILE,
+    CATEGORY_MIN_RATIO,
+    CATEGORY_QUOTA_MIN_SCORE_RATIO,
+    CATEGORY_WEIGHT_OVERRIDES,
     DIVERSITY_DISTANCE_THRESHOLD,
     DIVERSITY_PENALTY,
     FINAL_OUTPUT_COUNT,
@@ -18,6 +27,10 @@ from config import (
     PHOTOS_DIR,
     PLATFORMS,
     QWEN_MODEL,
+    SCENE_BUCKET_MAX,
+    SCENE_BUCKET_MAX_RELAXED,
+    SCENE_BUCKET_MINUTES,
+    TOP_SEGMENT_ENSURE_CATEGORY,
     VIDEO_FRAMES_DIR,
     VIDEO_OUTPUT_COUNT,
     VLM_SATURATION_RESAMPLE,
@@ -138,14 +151,41 @@ def _compute_vlm_dim_score(r, weights: dict, dim_w_sum: float) -> float:
     ) / dim_w_sum
 
 
-def _vlm_effective(r, weights: dict, dim_w_sum: float) -> float | None:
-    """VLM 有效分（与融合 q_vlm 公式一致，见 _compute_final_score）；VLM 未评分返回 None"""
+def _weights_for(r, base: dict) -> dict:
+    """该照片的维度权重：题材命中时覆盖平台权重，否则原样返回
+
+    题材化权重的现实意义：夜景的光影分、美食的色彩分、人像的人脸分
+    才是决定性的；用平台统一权重等于用同一把尺子量不同题材。
+    """
+    override = CATEGORY_WEIGHT_OVERRIDES.get((r.category or "").strip())
+    if not override:
+        return base
+    merged = dict(base)
+    merged.update(override)
+    return merged
+
+
+def _dim_weight_sum(weights: dict) -> float:
+    """构图/色彩/光影三项权重之和（VLM 维度加权分的分母）"""
+    return (
+        weights.get("composition", 0.35)
+        + weights.get("color", 0.30)
+        + weights.get("lighting", 0.20)
+    )
+
+
+def _vlm_effective(r, weights: dict, dim_w_sum: float | None = None) -> float | None:
+    """VLM 有效分（与融合 q_vlm 公式一致，见 _compute_final_score）；VLM 未评分返回 None
+
+    权重按题材覆盖后重算分母——dim_w_sum 参数仅为签名兼容，传入值不再使用。
+    """
     if r.vlm_overall_score <= 0:
         return None
-    return 0.7 * _compute_vlm_dim_score(r, weights, dim_w_sum) + 0.3 * r.vlm_overall_score
+    w = _weights_for(r, weights)
+    return 0.7 * _compute_vlm_dim_score(r, w, _dim_weight_sum(w)) + 0.3 * r.vlm_overall_score
 
 
-def _vlm_topiq_divergence(r, weights: dict, dim_w_sum: float) -> float | None:
+def _vlm_topiq_divergence(r, weights: dict, dim_w_sum: float | None = None) -> float | None:
     """VLM 有效分与 TOPIQ 分之差（离群诊断，不改分）"""
     q = _vlm_effective(r, weights, dim_w_sum)
     if q is None:
@@ -153,12 +193,15 @@ def _vlm_topiq_divergence(r, weights: dict, dim_w_sum: float) -> float | None:
     return round(abs(q - r.overall_score), 4)
 
 
-def _compute_final_score(r, weights: dict, dim_w_sum: float, face_scores: dict, l1_scores: dict) -> float:
+def _compute_final_score(r, weights: dict, dim_w_sum: float | None, face_scores: dict, l1_scores: dict) -> float:
     """融合综合分（0-10）：VLM×w_vlm + TOPIQ×w_topiq + 人脸×w_face + 客观×w_obj
 
     - VLM 已评分时人脸因素由 VLM 基于 L4 注入信息消化，face 权重归零（见 _effective_weights）
     - VLM 未评分（降级路径）时保留 face 权重；无脸照片权重重分配
+    - 维度权重按题材覆盖（CATEGORY_WEIGHT_OVERRIDES），dim_w_sum 参数仅为兼容保留
     """
+    weights = _weights_for(r, weights)
+    dim_w_sum = _dim_weight_sum(weights)
     has_face = face_scores.get(r.path, 0.0) > 0
     if has_face and r.person_is_subject is False:
         # VLM 裁断人物非主体（含背景路人/误检假脸）：face 权重归零，
@@ -368,7 +411,7 @@ def run_pipeline(
     )
 
     # ── 融合评分：VLM 多维审美 + TOPIQ + 人脸 + 客观指标统一加权 ──
-    score_map, top_photos, top_n, weights, dim_w_sum = _fuse_and_rank(
+    score_map, top_photos, top_n, weights, dim_w_sum, select_audit = _fuse_and_rank(
         aes_results, phash_map, face_scores, l1_scores, platform_config,
     )
 
@@ -376,6 +419,7 @@ def run_pipeline(
     return _save_outputs(
         output_dir, platform, prompt_hash, photos, rejected, merged,
         top_n, skipped_layers, aes_results, top_photos, score_map, weights, dim_w_sum,
+        select_audit,
     )
 
 
@@ -565,11 +609,15 @@ def _stage_l2(kept: list[Layer1Result], phash_map: dict, output_dir: Path,
         _emit(progress_callback, "layer_start", layer=2, layer_name="相似聚类")
         try:
             sharpness_scores = {r.path: r.sharpness for r in kept}
+            # 代表选取用 L1 综合分（清晰/曝光/噪点加权），而非只看 sharpness：
+            # 旧实现使连拍组里"最锐但过曝/高噪点"的照片挤掉更优的一张
+            quality_scores = {r.path: r.overall for r in kept}
             # 复用 L1 流水阶段算好的 pHash，跳过重复计算
             # 同日期约束：跨日期 pHash 相近的（海景/天空/建筑同质化）不视为连拍，防误合并
             clusters = cluster_photos(
                 [r.path for r in kept], sharpness_scores,
                 precomputed_hashes=phash_map, same_date=True,
+                quality_scores=quality_scores,
             )
             representatives = [r for c in clusters for r in (c.representatives or [c.representative])]
             merged = sum(c.member_count - 1 for c in clusters if c.member_count > 1)
@@ -752,6 +800,43 @@ def _derive_face_maps(face_results: list[Layer4Result]):
     return face_scores, face_hard_flags
 
 
+def _reapply_derived_scores(aes_results: list[Layer3Result],
+                            face_hard_flags: dict[str, str | None]) -> None:
+    """对 checkpoint 恢复的旧评分重算派生态（硬伤封顶 / VLM 归一化 / 钳制回填）
+
+    历史断链：`_stage_vlm` 的恢复分支直接返回旧记录，跳过了 `_apply_dims_to_result`
+    中的硬伤封顶与 clamp 回填。旧 checkpoint 的 `person_is_subject` 全为 None、
+    `vlm_clamp` 全为 False，即使修复了判定逻辑也不会生效——实测 28 张同时满足
+    "脸占比>10% + clarity<10% + VLM 自报人脸模糊" 的照片，0 张被钳制。
+    本函数保证任何恢复路径都重算派生态，使逻辑修复能作用于历史数据。
+    """
+    from core.layer3_aesthetic import (
+        _decide_vlm_clamp,
+        _normalize_vlm_batch,
+        apply_hard_flaw_caps,
+        clamp_hard_flaws_after_normalize,
+    )
+
+    for r in aes_results:
+        if r.error:
+            continue
+        r.capped_dims = apply_hard_flaw_caps(r)
+    # VLM 分数按当前开关重算（vlm_raw_score 已固化则幂等；旧记录无 raw 时以当前值为原始分）
+    _normalize_vlm_batch(aes_results)
+    # 钳制回填：用 L4 当前触发源 + 已存字段重算，不再只信任 checkpoint 里的旧 vlm_clamp
+    for r in aes_results:
+        if r.vlm_overall_score <= 0:
+            continue
+        clamp, source = _decide_vlm_clamp(
+            face_hard_flags.get(r.path),
+            r.person_is_subject,
+            r.hard_flaws,
+        )
+        r.vlm_clamp = clamp
+        r.clamp_source = source
+    clamp_hard_flaws_after_normalize(aes_results)
+
+
 def _stage_vlm(checkpoint: dict | None, rerun: set, incremental: bool, scoring_targets: list[str],
     need_topiq: bool, aes_topiq_results: list[Layer3Result], representatives: list[str],
     face_results: list[Layer4Result], face_hard_flags: dict, vlm_tasks: list,
@@ -794,6 +879,7 @@ def _stage_vlm(checkpoint: dict | None, rerun: set, incremental: bool, scoring_t
             aes_results.sort(key=lambda x: x.overall_score, reverse=True)
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
         logger.info(f"[L3] TOPIQ 重跑完成（替换 {replaced}/{len(aes_results)} 张），VLM 分复用 checkpoint")
+        _reapply_derived_scores(aes_results, face_hard_flags)
         _report_scoring_health(aes_results, "照片榜(TOPIQ重跑)")
         _save_layer_checkpoint(output_dir, 4, {
             "aes_results": [r.model_dump() for r in aes_results],
@@ -802,7 +888,8 @@ def _stage_vlm(checkpoint: dict | None, rerun: set, incremental: bool, scoring_t
     elif not need_vlm:
         aes_results = [Layer3Result(**r) for r in checkpoint["aes_results"]]
         skipped_layers = checkpoint.get("skipped_layers", skipped_layers)
-        # 恢复路径同样补排序 + 健康报警，与 VLM 重评分支对齐（杜绝静默通过）
+        # 恢复路径同样重算派生态 + 健康报警，与 VLM 重评分支对齐（杜绝旧 checkpoint 静默跳过封顶/钳制）
+        _reapply_derived_scores(aes_results, face_hard_flags)
         aes_results.sort(key=lambda x: x.overall_score, reverse=True)
         _report_scoring_health(aes_results, "照片榜(checkpoint恢复)")
         logger.info(f"[L3] 从 checkpoint 恢复: {len(aes_results)} 张")
@@ -904,11 +991,308 @@ def _stage_vlm(checkpoint: dict | None, rerun: set, incremental: bool, scoring_t
     return aes_results, skipped_layers
 
 
+def _scene_bucket(path: str) -> tuple[str, int] | None:
+    """拍摄场景桶 =（拍摄日期, 日内时间片序号）；无法解析返回 None（不参与配额）
+
+    依据：实测 Top100 中 13 个 30 分钟桶 ≥3 张、最大单桶 11 张，而标准 64-bit pHash
+    在 Top100 内只识别出 1 对相似——pHash 无法表达"同场景不同构图"，只能靠拍摄时间约束。
+    兼容 IMG_20260713_104947.HEIC / MVIMG_20260713_110423.jpg / 20260719_131006_895.jpg。
+    """
+    m = _PHOTO_TS_RE.search(Path(path).name)
+    if not m:
+        return None
+    date, hh, mm = m.group(1), int(m.group(2)), int(m.group(3))
+    return date, (hh * 60 + mm) // SCENE_BUCKET_MINUTES
+
+
+_PHOTO_TS_RE = re.compile(r"(20\d{6})[_-](\d{2})(\d{2})")
+
+
+def _greedy_by_bucket(ranked: list[Layer3Result], k: int, cap: int):
+    """按分数降序贪心选取，同一场景桶不超过 cap 张；返回 (选中, 被配额拦下的)"""
+    chosen: list[Layer3Result] = []
+    used: Counter = Counter()
+    blocked: list[Layer3Result] = []
+    for r in ranked:
+        b = _scene_bucket(r.path)
+        if b is not None and used[b] >= cap:
+            blocked.append(r)
+            continue
+        chosen.append(r)
+        if b is not None:
+            used[b] += 1
+        if len(chosen) >= k:
+            break
+    return chosen, blocked
+
+
+def _apply_category_quota(chosen: list[Layer3Result], ranked: list[Layer3Result],
+                          score_map: dict[str, float], k: int) -> list[Layer3Result]:
+    """类别保底：缺口从已选中最低分的非保底类照片置换，不增加总量
+
+    实测人像入榜率 7.2%、动物 3.8%，远低于风景 14.1%，属系统性失衡；
+    旅行照里"人"最可能被发出来，故对人像/人文纪实给最低配额。
+
+    两条硬约束，防止"为凑数塞烂片"与"保底绕过多样性"：
+    1) 质量地板：候选融合分需 ≥ 置换前入选最低分 × CATEGORY_QUOTA_MIN_SCORE_RATIO；
+    2) 场景配额：置换后同桶不得超过 SCENE_BUCKET_MAX（不再借用放宽上限，
+       否则保底会把某场景堆到 3 张而审计仍报告 relax_level=0）。
+    """
+    if not CATEGORY_MIN_RATIO or not chosen:
+        return chosen
+    # 地板基准在置换前一次算定，避免逐次置换后最低分下滑、地板跟着塌陷
+    floor = min(score_map.get(r.path, 0.0) for r in chosen) * CATEGORY_QUOTA_MIN_SCORE_RATIO
+    chosen_paths = {r.path for r in chosen}
+    bucket_used: Counter = Counter()
+    for r in chosen:
+        b = _scene_bucket(r.path)
+        if b is not None:
+            bucket_used[b] += 1
+
+    for cat, ratio in CATEGORY_MIN_RATIO.items():
+        need = int(round(k * ratio))
+        have = sum(1 for r in chosen if (r.category or "") == cat)
+        lack = need - have
+        if lack <= 0:
+            continue
+        pool = [r for r in ranked
+                if (r.category or "") == cat and r.path not in chosen_paths
+                and score_map.get(r.path, 0.0) >= floor]
+        added = 0
+        for cand in pool:
+            if added >= lack:
+                break
+            # 从尾部找分数最低的非保底类作为被置换者
+            victim_idx = None
+            for i in range(len(chosen) - 1, -1, -1):
+                if (chosen[i].category or "") in CATEGORY_MIN_RATIO:
+                    continue
+                victim_idx = i
+                break
+            if victim_idx is None:
+                break
+            victim = chosen[victim_idx]
+            cb, vb = _scene_bucket(cand.path), _scene_bucket(victim.path)
+            # 严格场景配额：同桶置换净值不变，跨桶置换才 +1
+            if cb is not None and cb != vb and bucket_used[cb] >= SCENE_BUCKET_MAX:
+                continue
+            if vb is not None:
+                bucket_used[vb] -= 1
+            chosen_paths.discard(victim.path)
+            chosen_paths.add(cand.path)
+            chosen[victim_idx] = cand
+            if cb is not None:
+                bucket_used[cb] += 1
+            added += 1
+        if added:
+            logger.info(f"[类别保底] {cat} 补 {added} 张（目标 {need}，原有 {have}）")
+
+    chosen.sort(key=lambda x: score_map.get(x.path, 0.0), reverse=True)
+    return chosen
+
+
+def _ensure_top_segment(chosen: list[Layer3Result], ranked: list[Layer3Result],
+                        score_map: dict[str, float], seg_size: int):
+    """前段保底：榜单前 seg_size 张（平台发帖量，用户实际会发的第一屏）内，
+    每个保底类别至少 1 张；返回 (新榜单, 置换次数)
+
+    实测：Top100 人像 10 张，但 Top12 人像 0 张——全文配额对用户第一眼看到的
+    结果完全不可见。这里只替换"前段最低分的非保底类照片"，且仍受场景桶严格
+    配额与质量地板约束，因此代价可控。
+    注意：不重新排序。保底照片分数天然低于前段均值，重排会把它挤出前段，保底即失效。
+    """
+    if not TOP_SEGMENT_ENSURE_CATEGORY or not CATEGORY_MIN_RATIO:
+        return chosen, 0
+    if seg_size <= 0 or len(chosen) <= seg_size:
+        return chosen, 0
+
+    head = chosen[:seg_size]
+    tail = chosen[seg_size:]
+    head_paths = {r.path for r in head}
+    floor = min(score_map.get(r.path, 0.0) for r in head) * CATEGORY_QUOTA_MIN_SCORE_RATIO
+    buckets = Counter(_scene_bucket(r.path) for r in chosen if _scene_bucket(r.path) is not None)
+    changes = 0
+
+    for cat in CATEGORY_MIN_RATIO:
+        if any((r.category or "") == cat for r in head):
+            continue
+        # 候选优先取自榜尾（榜内移动不改变桶计数，必不破配额），其次榜外高分候选
+        in_list = [r for r in tail if (r.category or "") == cat]
+        tail_paths = {r.path for r in tail}
+        off_list = [r for r in ranked
+                    if (r.category or "") == cat and r.path not in head_paths
+                    and r.path not in tail_paths]
+        pool = sorted(in_list + off_list,
+                      key=lambda r: score_map.get(r.path, 0.0), reverse=True)
+        pool = [r for r in pool if score_map.get(r.path, 0.0) >= floor]
+        if not pool:
+            continue
+
+        # 被置换者：前段中分数最低、且不属于任何保底类别
+        victim_idx = None
+        for i in range(len(head) - 1, -1, -1):
+            if (head[i].category or "") in CATEGORY_MIN_RATIO:
+                continue
+            victim_idx = i
+            break
+        if victim_idx is None:
+            continue
+        victim = head[victim_idx]
+        vb = _scene_bucket(victim.path)
+
+        placed = None
+        for cand in pool:
+            cb = _scene_bucket(cand.path)
+            # 榜内候选（在榜尾）移动位置不改变桶计数；同桶置换净值也不变；
+            # 只有榜外候选新进榜才占用一个新名额
+            already = cand.path in tail_paths
+            if cb is not None and not already and cb != vb and buckets[cb] >= SCENE_BUCKET_MAX:
+                continue
+            placed = cand
+            break
+        if placed is None:
+            continue
+
+        already = placed.path in tail_paths
+        cb = _scene_bucket(placed.path)
+        tail = [r for r in tail if r.path != placed.path]
+        head[victim_idx] = placed
+        if already:
+            # 榜内置换：placed 从榜尾移入前段，被挤出的 victim 回填榜尾，总量守恒
+            tail = sorted(tail + [victim], key=lambda r: score_map.get(r.path, 0.0), reverse=True)
+        if vb is not None:
+            buckets[vb] -= 1
+        if cb is not None and not already:
+            buckets[cb] += 1
+        changes += 1
+        logger.info(f"[前段保底] {cat} 进入前 {seg_size} 张，替换 {victim.filename}")
+
+    return head + tail, changes
+
+
+def _select_with_quota(ranked: list[Layer3Result], score_map: dict[str, float], k: int,
+                       top_segment: int = 0):
+    """选片：场景桶硬配额（逐级放宽）→ 类别保底置换 → 前段保底；返回 (top, 审计信息)"""
+    chosen: list[Layer3Result] = []
+    relax = 0
+    for cap in (SCENE_BUCKET_MAX, SCENE_BUCKET_MAX_RELAXED, 10 ** 9):
+        chosen, blocked = _greedy_by_bucket(ranked, k, cap)
+        if len(chosen) >= k:
+            break
+        relax += 1
+    # 仍不足（k 超过候选总数）：按分数补齐
+    if len(chosen) < k:
+        have = {r.path for r in chosen}
+        for r in ranked:
+            if len(chosen) >= k:
+                break
+            if r.path not in have:
+                chosen.append(r)
+                have.add(r.path)
+
+    chosen = _apply_category_quota(chosen, ranked, score_map, k)
+    chosen, top_changes = _ensure_top_segment(chosen, ranked, score_map, top_segment)
+
+    buckets = Counter(_scene_bucket(r.path) for r in chosen if _scene_bucket(r.path) is not None)
+    audit = {
+        "scene_bucket_max": SCENE_BUCKET_MAX,
+        "relax_level": relax,
+        "scene_bucket_count": len(buckets),
+        "scene_bucket_peak": max(buckets.values()) if buckets else 0,
+        "category_counts": dict(Counter((r.category or "未分类") for r in chosen)),
+        "top_segment": top_segment,
+        "top_segment_changes": top_changes,
+        "top_segment_category_counts": dict(
+            Counter((r.category or "未分类") for r in chosen[:top_segment])
+        ) if top_segment else {},
+    }
+    return chosen, audit
+
+
+def _percentile_of(values: list[float], q: float) -> float:
+    """线性插值分位数（与 numpy.percentile 默认算法同构，免引入 numpy 依赖）"""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    pos = q * (len(s) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
+
+
+def _assign_buckets(scores: dict[str, float], selected_paths: set[str]) -> dict:
+    """三桶分级（精选 / 可用 / 淘汰），返回全部候选的分桶结果与门槛
+
+    门槛 = max(批次分位数, 固定底线)，取严：
+    - 精选：final_score >= max(P85, 7.0)
+    - 淘汰：final_score <  max(P20, 4.0)
+    - 可用：其余
+
+    两道闸都要生效：分位数吸收批次难度（整批都好片时不至于全进精选），
+    固定底线保住绝对语义（整批都废片时不会因“相对较好”而进精选）。
+
+    两条现实约束：
+    1. 已入选 top_photos 的照片永不标淘汰——类别保底会特意选低分照片冲配额，
+       标成淘汰会与“入选”自相矛盾，降级为可用并置 promoted=True 留痕；
+    2. 分位数用全候选集而非已选子集算，否则门槛会随配额结果漂移。
+    """
+    vals = list(scores.values())
+    if not vals:
+        return {"map": {}, "thresholds": {}, "counts": {}}
+
+    p_select = _percentile_of(vals, BUCKET_SELECT_PERCENTILE)
+    p_reject = _percentile_of(vals, BUCKET_REJECT_PERCENTILE)
+    # 取 max：两个门槛都是“数字越大越严”
+    t_select = max(p_select, BUCKET_SELECT_FLOOR)
+    t_reject = max(p_reject, BUCKET_REJECT_FLOOR)
+    # 异常保护：淘汰门槛不得反超精选门槛（权重配置异常时强制拉开）
+    if t_reject >= t_select:
+        t_reject = min(t_reject, t_select - 1e-6)
+
+    ordered = sorted(vals)
+    n = len(ordered)
+    out: dict[str, dict] = {}
+    counts = {"select": 0, "maybe": 0, "reject": 0}
+    promoted = 0
+    for path, s in scores.items():
+        # 百分位：低于该分数的占比（并列取中位位置，避免名次抖动）
+        lo = _bisect_left(ordered, s)
+        hi = _bisect_right(ordered, s)
+        pct = round((lo + hi) / 2 / n * 100, 2)
+        if s >= t_select:
+            bucket, is_promoted = "select", False
+        elif s < t_reject:
+            if path in selected_paths:
+                bucket, is_promoted = "maybe", True
+                promoted += 1
+            else:
+                bucket, is_promoted = "reject", False
+        else:
+            bucket, is_promoted = "maybe", False
+        counts[bucket] += 1
+        out[path] = {"bucket": bucket, "percentile": pct, "promoted": is_promoted}
+
+    return {
+        "map": out,
+        "thresholds": {
+            "select": round(t_select, 4),
+            "reject": round(t_reject, 4),
+            "select_p85": round(p_select, 4),
+            "reject_p20": round(p_reject, 4),
+            "select_floor": BUCKET_SELECT_FLOOR,
+            "reject_floor": BUCKET_REJECT_FLOOR,
+        },
+        "counts": {**counts, "promoted": promoted},
+    }
+
+
 def _fuse_and_rank(aes_results: list[Layer3Result], phash_map: dict, face_scores: dict,
     l1_scores: dict, platform_config: dict):
-    """融合评分：VLM 多维审美 + TOPIQ + 人脸 + 客观指标统一加权 + 多样性惩罚
+    """融合评分：VLM 多维审美 + TOPIQ + 人脸 + 客观指标统一加权 + 多样性配额选片
 
-    返回 (score_map, top_photos, top_n, weights, dim_w_sum)。"""
+    返回 (score_map, top_photos, top_n, weights, dim_w_sum, select_audit)。"""
     # ── 融合评分：VLM 多维审美 + TOPIQ + 人脸 + 客观指标统一加权 ──
     # 说明：VLM 评分失败/未配置 API 时，q_vlm 回退为 TOPIQ 分，保证仍可排序。
     weights = platform_config.get("weights", {
@@ -919,48 +1303,48 @@ def _fuse_and_rank(aes_results: list[Layer3Result], phash_map: dict, face_scores
 
     # 融合分计算复用模块级函数（与 run_video_ranking 同源）
 
-    # 多样性惩罚：复用 L1 流水阶段算好的 pHash（不再重复计算）
-    hash_cache: dict[str, imagehash.ImageHash | None] = {
-        r.path: phash_map.get(r.path) for r in aes_results
-    }
-    if not any(hash_cache.values()):
-        # phash_map 缺失（旧 checkpoint 恢复路径）：兜底重算，保证多样性惩罚生效
-        from core.layer2_similarity import compute_phash
-        logger.info("phash_map 缺失，兜底重算 pHash（多样性惩罚）...")
-        for r in aes_results:
-            hash_cache[r.path] = compute_phash(r.path)
-
     # 计算融合分
     score_map: dict[str, float] = {r.path: _compute_final_score(r, weights, dim_w_sum, face_scores, l1_scores) for r in aes_results}
 
-    # 多样性惩罚：对相似照片扣分，避免同场景占据多个名额
-    penalized: set[str] = set()
-    for i in range(len(aes_results)):
-        hi = hash_cache[aes_results[i].path]
-        if hi is None:
-            continue
-        for j in range(i + 1, len(aes_results)):
-            hj = hash_cache[aes_results[j].path]
-            if hj is None:
-                continue
-            distance = abs(int(hi - hj))
-            if distance < DIVERSITY_DISTANCE_THRESHOLD:
-                penalize_path = aes_results[j].path  # j 排名靠后
-                if penalize_path not in penalized:
-                    score_map[penalize_path] *= (1.0 - DIVERSITY_PENALTY)
-                    penalized.add(penalize_path)
-                    logger.info(
-                        f"[多样性] 对 {Path(penalize_path).name} 施加 "
-                        f"{DIVERSITY_PENALTY*100:.0f}% 扣分"
-                        f"（与 {Path(aes_results[i].path).name} 相似，距离={distance}）"
-                    )
-
-    # 按融合分排序，直接取 Top N（不再分两级，避免候选池边界错杀）
+    # 先排序，再在配额约束下选片（必须按此顺序：旧的"排序前扣分"逻辑中
+    # "penalize j = 排名靠后" 是伪命题，J 尚未排序；且 DIVERSITY_DISTANCE_THRESHOLD(10)
+    # 小于 HAMMING_THRESHOLD(16)，候选对已在 L2 被合并，惩罚循环实际空转）
     aes_results.sort(key=lambda x: score_map[x.path], reverse=True)
     top_n = min(FINAL_OUTPUT_COUNT, len(aes_results))
-    top_photos = aes_results[:top_n]
+    # 前段 = 平台发帖量（小红书/朋友圈 12 张）：用户实际只会发/看这么多
+    top_segment = int(platform_config.get("output_count", 12))
+    top_photos, select_audit = _select_with_quota(
+        aes_results, score_map, top_n, top_segment=top_segment)
+    logger.info(
+        f"[多样性] 场景配额 {select_audit['scene_bucket_max']} 张/桶（放宽级别 "
+        f"{select_audit['relax_level']}）→ 覆盖 {select_audit['scene_bucket_count']} 个场景桶，"
+        f"最大单桶 {select_audit['scene_bucket_peak']} 张；类别分布 {select_audit['category_counts']}"
+    )
+    logger.info(
+        f"[前段] 前 {top_segment} 张类别分布 {select_audit['top_segment_category_counts']}"
+        f"（保底置换 {select_audit['top_segment_changes']} 张）"
+    )
 
     logger.info(f"[终审] 平台: {platform_config['name']}, 候选: {len(aes_results)}, 入选: {len(top_photos)}")
+
+    # 三桶分级：精选/可用/淘汰（门槛 = max(批次分位数, 固定底线)）
+    bucket_info = _assign_buckets(score_map, {r.path for r in top_photos})
+    if bucket_info["thresholds"]:
+        t = bucket_info["thresholds"]
+        c = bucket_info["counts"]
+        logger.info(
+            f"[三桶] 精选 {c['select']} / 可用 {c['maybe']} / 淘汰 {c['reject']}"
+            f"（门槛 精选≥{t['select']:.2f} [P85={t['select_p85']:.2f} 底线{t['select_floor']}]，"
+            f"淘汰<{t['reject']:.2f} [P20={t['reject_p20']:.2f} 底线{t['reject_floor']}]"
+            + (f"，已入选提级 {c['promoted']}" if c.get("promoted") else "")
+            + "）"
+        )
+    select_audit = {
+        **select_audit,
+        "bucket_thresholds": bucket_info["thresholds"],
+        "bucket_counts": bucket_info["counts"],
+        "bucket_map": bucket_info["map"],
+    }
     logger.info(
         f"[终审] 融合权重: VLM{FUSION_WEIGHTS['vlm']} TOPIQ{FUSION_WEIGHTS['topiq']} "
         f"人脸{FUSION_WEIGHTS['face']}（VLM 评分时归零） 客观{FUSION_WEIGHTS['objective']} | "
@@ -970,13 +1354,14 @@ def _fuse_and_rank(aes_results: list[Layer3Result], phash_map: dict, face_scores
         f"人脸{weights.get('face', 0.15)}"
     )
 
-    return score_map, top_photos, top_n, weights, dim_w_sum
+    return score_map, top_photos, top_n, weights, dim_w_sum, select_audit
 
 
 def _save_outputs(output_dir: Path, platform: str, prompt_hash: str, photos: list[Path],
     rejected: list, merged: int, top_n: int, skipped_layers: list[str],
     aes_results: list[Layer3Result], top_photos: list[Layer3Result],
-    score_map: dict[str, float], weights: dict, dim_w_sum: float):
+    score_map: dict[str, float], weights: dict, dim_w_sum: float,
+    select_audit: dict | None = None):
     """保存榜单产物（ranking/full_ranking/run_meta + 展示照片复制）并汇总"""
     # ── 保存结果 ──
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -986,17 +1371,35 @@ def _save_outputs(output_dir: Path, platform: str, prompt_hash: str, photos: lis
         if old.is_file() and old.name != "checkpoint.json":
             old.unlink()
 
+    # 三桶分级明细（每位候选的桶 + 批次百分位），排行榜与完整榜共用
+    bucket_map = (select_audit or {}).get("bucket_map", {})
+
     # 合并结果并保存
     final_results: list[FinalResult] = []
     for r in top_photos:
+        info = bucket_map.get(r.path, {})
         final_results.append(FinalResult(
             path=r.path,
             filename=r.filename,
             aesthetic_score=r.aesthetic_score,
             overall_score=r.overall_score,
-            final_score=score_map[r.path],  # 融合综合分（0-10），含多样性惩罚
+            final_score=score_map[r.path],  # 融合综合分（0-10），已过场景/类别配额选片
             category=r.category,  # L3 VLM 分类标签（风景/人像/夜景等）
+            bucket=info.get("bucket", ""),
+            percentile=info.get("percentile", 0.0),
         ))
+
+    # 复制入选照片（序号名前缀，供前端展示）
+    # 必须在写榜单 JSON 之前：榜单里的 filename 要指向磁盘上真实存在的展示副本，
+    # 否则前端 <img src="/api/results/.../{filename}"> 会对原名 404。
+    display_names: dict[str, str] = {}
+    for i, r in enumerate(top_photos):
+        src = Path(r.path)
+        dst = output_dir / f"{i+1:02d}_{src.name}"
+        shutil.copy2(src, dst)
+        display_names[r.path] = dst.name
+    for fr in final_results:
+        fr.filename = display_names.get(fr.path, fr.filename)
 
     ranking_file = output_dir / "ranking.json"
     with open(ranking_file, "w", encoding="utf-8") as f:
@@ -1006,10 +1409,15 @@ def _save_outputs(output_dir: Path, platform: str, prompt_hash: str, photos: lis
     full_ranking = [
         {
             "path": r.path,
-            "filename": r.filename,
+            # 入选者有展示副本名，未入选者保留原名
+            "filename": display_names.get(r.path, r.filename),
             "aesthetic_score": r.aesthetic_score,
             "overall_score": r.overall_score,
             "final_score": score_map[r.path],
+            # 三桶分级：精选/可用/淘汰 + 批次百分位（跨批次可比的相对位次）
+            "bucket": bucket_map.get(r.path, {}).get("bucket", ""),
+            "percentile": bucket_map.get(r.path, {}).get("percentile", 0.0),
+            "bucket_promoted": bucket_map.get(r.path, {}).get("promoted", False),
             "category": r.category,
             "vlm_overall_score": r.vlm_overall_score,
             # 归一化前原始分（增量全量重归一化的参照，取证用）
@@ -1024,6 +1432,10 @@ def _save_outputs(output_dir: Path, platform: str, prompt_hash: str, photos: lis
             "person_is_subject": r.person_is_subject,
             "vlm_saturated": r.vlm_saturated,
             "hard_flaws": r.hard_flaws,
+            # 硬伤封顶审计 + VLM 评语（前端展示"为什么入选/落选"，历史版本只存分数不存理由）
+            "capped_dims": r.capped_dims,
+            "score_reason": r.score_reason,
+            "reason_source": r.reason_source,
             # 离群诊断：VLM 与 TOPIQ 严重分歧的照片（TOPIQ 有语义盲区，分歧≠错误）
             "vlm_topiq_divergence": _vlm_topiq_divergence(r, weights, dim_w_sum),
         }
@@ -1036,26 +1448,19 @@ def _save_outputs(output_dir: Path, platform: str, prompt_hash: str, photos: lis
     logger.info(f"完整排行已保存: {len(full_ranking)} 条 → {full_file}")
 
     # 跑批元信息（与 checkpoint meta 同源）：最终产物可追溯 prompt/模型版本
+    # 剔除 bucket_map（逐张明细已在 full_ranking 里，此处只留门槛与计数）
+    audit_light = {k: v for k, v in (select_audit or {}).items() if k != "bucket_map"}
     run_meta = {
         "prompt_hash": prompt_hash,
         "model": QWEN_MODEL,
         "platform": platform,
         "photo_count": len(full_ranking),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        # 选片审计：场景配额放宽级别 + 覆盖桶数 + 最大单桶 + 类别分布 + 三桶门槛
+        "selection": audit_light,
     }
     with open(output_dir / "run_meta.json", "w", encoding="utf-8") as f:
         json.dump(run_meta, f, ensure_ascii=False, indent=2)
-
-    # 复制照片（序号名，供前端展示）
-    display_names: dict[str, str] = {}
-    for i, r in enumerate(top_photos):
-        src = Path(r.path)
-        dst = output_dir / f"{i+1:02d}_{src.name}"
-        shutil.copy2(src, dst)
-        display_names[r.path] = dst.name
-    # 榜单 filename 用展示文件名（保证 /api/results/.../{filename} 可访问）
-    for fr in final_results:
-        fr.filename = display_names.get(fr.path, fr.filename)
 
     logger.info(f"输出: Top {top_n} → {output_dir}")
 

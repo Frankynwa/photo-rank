@@ -78,7 +78,7 @@ class TestGoldenClampCases:
         # 第 3 张（原始 7 分）被判定人像硬伤
         results[2].vlm_clamp = True
         from core.layer3_aesthetic import _normalize_vlm_batch
-        _normalize_vlm_batch(results)
+        _normalize_vlm_batch(results, enabled=True)
         # 原始分正常参与归一化：7 分被拉伸到 ~6.67（p5=5/p95=8），
         # 而不是旧 bug 的"先钳到 6 再被拉伸压到 2.63"
         assert abs(results[2].vlm_overall_score - 6.6667) < 1e-3

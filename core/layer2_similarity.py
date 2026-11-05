@@ -18,6 +18,22 @@ logger = logging.getLogger(__name__)
 # 当照片数 < 此值时，Python 级别的暴力搜索因更低的常数开销反而更快
 _BK_TREE_FALLBACK_SIZE = 500
 
+# 簇内保留代表数（供 L3 参与竞争；余者不进审美评分）
+# 历史实现固定取 2 张且仅按 sharpness 排序：连拍组里"最锐但闭眼/构图差"的照片
+# 会挤掉真正最优的一张。现改为按 L1 综合分（清晰/曝光/噪点加权）排序，
+# 并按组大小动态给名额：小组全留，大组最多 3 张，把"组内选优"交给 L3 之后的融合排序。
+_REP_COUNT_SMALL = 2   # 组大小 ≤2：全留（不损失选择）
+_REP_COUNT_MID = 2     # 组大小 3-4：留 2 张
+_REP_COUNT_LARGE = 3   # 组大小 ≥5：留 3 张（避免连拍全量送 VLM 推高成本）
+
+
+def _representative_count(group_size: int) -> int:
+    if group_size <= _REP_COUNT_SMALL:
+        return group_size
+    if group_size <= 4:
+        return _REP_COUNT_MID
+    return _REP_COUNT_LARGE
+
 # 文件名中的拍摄日期模式：MVIMG_20260707_064715.jpg → 20260707
 # 仅匹配照片命名（视频帧无日期，不受影响）
 _PHOTO_DATE_RE = re.compile(r"(20\d{6})_")
@@ -187,6 +203,7 @@ def cluster_photos(
     threshold: int = HAMMING_THRESHOLD,
     precomputed_hashes: dict[str, imagehash.ImageHash] | None = None,
     same_date: bool = False,
+    quality_scores: dict[str, float] | None = None,
 ) -> list[SimilarityClusterModel]:
     """将相似照片聚类（Union-Find + 感知哈希）
 
@@ -194,6 +211,8 @@ def cluster_photos(
     哈希计算阶段直接聚类；为 None 或缺失时回退到内部串行计算。
     same_date: 仅同日期照片可合并（照片榜开启，防跨日期不同场景误合并）；
                视频榜帧无日期信息，保持 False 不启用。
+    quality_scores: 代表选取的排序依据（L1 综合分：清晰/曝光/噪点加权）；
+                   缺失时回落 sharpness_scores（旧行为）。
     """
     paths = [str(p) for p in image_paths]
     date_keys = {p: photo_date_key(p) for p in paths} if same_date else None
@@ -237,14 +256,15 @@ def cluster_photos(
             groups[root] = []
         groups[root].append(p)
 
-    # 构建结果：每组按清晰度取前 2 张作为代表
-    # 同场景连拍的第 2 张也有机会进入审美层（L3）参与竞争，
-    # 最终由融合分 + 多样性惩罚决定去留，避免"只留清晰但构图差"的一张。
+    # 构建结果：组内按 L1 综合分（缺失时回退清晰度）排序取代表
+    # 同场景连拍的多张都有机会进入审美层（L3）参与竞争，
+    # 最终由融合分 + 场景配额决定去留，避免"只留清晰但构图差"的一张。
+    rank_key = quality_scores or sharpness_scores
     clusters: list[SimilarityClusterModel] = []
     for root, members in groups.items():
-        ranked = sorted(members, key=lambda p: sharpness_scores.get(p, 0), reverse=True)
+        ranked = sorted(members, key=lambda p: rank_key.get(p, 0), reverse=True)
         best = ranked[0]
-        representatives = ranked[:2]
+        representatives = ranked[:_representative_count(len(ranked))]
         clusters.append(SimilarityClusterModel(
             cluster_id=len(clusters),
             representative=best,

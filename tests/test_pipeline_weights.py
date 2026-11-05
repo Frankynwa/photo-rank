@@ -93,16 +93,76 @@ class TestVlmEffective:
         assert calls  # _compute_vlm_dim_score 被调用 → 未引用未定义的 _vlm_dim_score
         assert result is not None
 
-    def test_dim_w_sum_zero_falls_back_to_overall(self):
-        """维度权重和为零（异常配置）时应回退到 TOPIQ 分，不崩溃"""
+    def test_all_zero_dim_weights_falls_back_to_topiq(self):
+        """维度权重全为 0（异常配置）时分母为 0，应回退 r.overall_score 不崩溃
+
+        注意：dim_w_sum 入参已不再生效（改为内部按题材重算），必须用全 0 权重才触发回退。
+        """
         r = Layer3Result(
             path="/a.jpg", filename="a.jpg",
             composition_score=8.0, color_score=7.5, lighting_score=7.0,
             vlm_overall_score=6.8, overall_score=7.2,
         )
-        # dim_w_sum=0 → _compute_vlm_dim_score 回退 r.overall_score
-        q = _vlm_effective(r, _WEIGHTS, 0.0)
+        zero_w = {"composition": 0.0, "color": 0.0, "lighting": 0.0, "face": 1.0}
+        q = _vlm_effective(r, zero_w, 0.0)
         assert q == pytest.approx(0.7 * 7.2 + 0.3 * 6.8, abs=1e-6)
+
+    def test_dim_w_sum_arg_ignored(self):
+        """回归：dim_w_sum 入参仅为签名兼容，传垃圾值不应影响结果（内部按题材重算）"""
+        r = Layer3Result(
+            path="/a.jpg", filename="a.jpg",
+            composition_score=8.0, color_score=7.5, lighting_score=7.0,
+            vlm_overall_score=6.8,
+        )
+        normal = _vlm_effective(r, _WEIGHTS, _DIM_W_SUM)
+        garbage = _vlm_effective(r, _WEIGHTS, 999.0)
+        assert normal == pytest.approx(garbage, abs=1e-9)
+
+
+class TestCategoryWeightOverride:
+    """题材化维度权重：命中 CATEGORY_WEIGHT_OVERRIDES 的题材覆盖平台权重
+
+    依据：用同一把尺子量不同题材——夜景的光影、美食的色彩、人像的人脸
+    才是决定性维度，平台统一权重会让"夜色氛围好但构图普通"输给"白天构图工整但无光影"。
+    """
+
+    def test_override_applied_when_category_hit(self):
+        """命中题材时权重被覆盖（四项齐全）"""
+        from core.pipeline import _weights_for
+
+        r = Layer3Result(path="/a.jpg", filename="a.jpg", category="夜景")
+        w = _weights_for(r, _WEIGHTS)
+        assert w["lighting"] == 0.40  # 夜景光影权重最高
+        assert w["composition"] == 0.20
+        assert w["color"] == 0.30
+        assert sum(w[k] for k in ("composition", "color", "lighting", "face")) == pytest.approx(1.0)
+
+    def test_base_weights_kept_when_category_miss(self):
+        """未命中题材（空/"其他"/未列出的题材）应原样返回平台权重"""
+        from core.pipeline import _weights_for
+
+        for cat in ("", "其他", "未分类", "航拍"):
+            r = Layer3Result(path="/a.jpg", filename="a.jpg", category=cat)
+            assert _weights_for(r, _WEIGHTS) == _WEIGHTS
+
+    def test_base_dict_not_mutated(self):
+        """覆盖不应就地修改传入的 base 权重（否则会影响后续照片）"""
+        from core.pipeline import _weights_for
+
+        base = dict(_WEIGHTS)
+        r = Layer3Result(path="/a.jpg", filename="a.jpg", category="人像")
+        _weights_for(r, base)
+        assert base == _WEIGHTS
+
+    def test_override_changes_ranking_of_same_dimensions(self):
+        """同一组维度分，不同题材应得出不同有效分（权重重构排序）"""
+        dims = dict(composition_score=9.0, color_score=6.0, lighting_score=9.0,
+                    vlm_overall_score=7.0)
+        portrait = Layer3Result(path="/p.jpg", filename="p.jpg", category="人像", **dims)
+        building = Layer3Result(path="/b.jpg", filename="b.jpg", category="建筑", **dims)
+        # 人像：色彩权重 0.25 高于建筑 0.20，而 color=6 是低分 → 人像被拉低
+        # 建筑：构图 0.45 最高，构图=9 的高分被放大 → 有效分更高
+        assert _vlm_effective(building, _WEIGHTS) > _vlm_effective(portrait, _WEIGHTS)
 
 
 class TestVlmTopiqDivergence:

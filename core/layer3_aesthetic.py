@@ -67,6 +67,41 @@ _CATEGORY_ALIASES = {
 # VLM 硬伤枚举白名单（prompt 中的硬伤清单由本元组动态生成，单一来源防契约错位）
 _HARD_FLAW_ENUMS = ("模糊", "过曝", "欠曝", "噪点明显", "歪斜", "画面杂乱", "主体裁切", "逆光发黑", "地平线穿头", "闭眼", "人脸模糊")
 
+# 硬伤 → 维度分的封顶映射（代码侧强制，不依赖 VLM 遵守 prompt）
+# 依据：实测 VLM 报"画面杂乱"295 张中 94.2% 的构图分 >4、报"歪斜"100% >4，
+# prompt 中"存在任何硬伤：对应维度上限 4 分"从未被执行，硬伤字段沦为装饰。
+# "人脸模糊"不在此表：prompt 明确其仅按自然减分处理，由 L4 钳制链路另管。
+_FLAW_DIM_MAP = {
+    "画面杂乱": "composition_score",
+    "主体裁切": "composition_score",
+    "歪斜": "composition_score",
+    "模糊": "composition_score",
+    "过曝": "lighting_score",
+    "欠曝": "lighting_score",
+    "逆光发黑": "lighting_score",
+}
+
+
+def apply_hard_flaw_caps(result: "Layer3Result") -> list[str]:
+    """按 VLM 自报硬伤强制封顶对应维度分，返回被封顶的维度名列表（供审计）"""
+    from config import HARD_FLAW_CAP_ENABLED, HARD_FLAW_DIM_CAP
+
+    if not HARD_FLAW_CAP_ENABLED or not result.hard_flaws:
+        return []
+    capped: list[str] = []
+    for flaw in result.hard_flaws:
+        if flaw == "人脸模糊":  # 人脸模糊由 L4 双证据钳制链路处理，不做维度封顶
+            continue
+        dim = _FLAW_DIM_MAP.get(flaw)
+        if not dim:
+            continue
+        cur = getattr(result, dim, None)
+        if isinstance(cur, (int, float)) and cur > HARD_FLAW_DIM_CAP:
+            setattr(result, dim, HARD_FLAW_DIM_CAP)
+            if dim not in capped:
+                capped.append(dim)
+    return capped
+
 # L4 "未检测到人脸"文案标记：命中时走瘦身版 prompt（省去人脸判读段落）
 _NO_FACE_MARKER = "未检测到人脸"
 
@@ -388,6 +423,48 @@ def _merge_dims(first: dict, second: dict) -> dict:
     return out
 
 
+_REASON_MAX_CHARS = 36  # 中文一句 ≤30 汉字；36 字符为标点留余量
+
+
+def _trim_reason(text: str, limit: int = _REASON_MAX_CHARS) -> str:
+    """截断评分理由，优先在标点处收尾（避免中文被砍成半句）
+
+    历史实现是 reason.strip()[:200]：长理由被硬截在半句上，比不截更难看。
+    超长时回退到最近的句读处，找不到合适断点才加省略号。
+    """
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind(p) for p in "。；，、,.;")
+    if cut >= limit // 2:
+        return head[:cut + 1]
+    return head.rstrip() + "…"
+
+
+def _template_reason(result: "Layer3Result") -> str:
+    """VLM 未给理由时的确定性兜底（100% 覆盖，零成本）
+
+    三档句式：硬伤优先（陈述事实）→ 亮点次之（夸最强维度）→ 平稳兜底。
+    不用"这张照片"开头，与 VLM 自然语言理由混排时不突兀。
+    """
+    cat = result.category or "画面"
+    flaws = [f for f in result.hard_flaws if f and f != "无硬伤"]
+    if flaws:
+        return f"{cat}，存在{'、'.join(flaws[:2])}"
+    dims = (
+        ("构图", result.composition_score),
+        ("色彩", result.color_score),
+        ("光影", result.lighting_score),
+    )
+    name, score = max(dims, key=lambda kv: kv[1])
+    if score >= 8.0:
+        return f"{cat}，{name}突出"
+    if score >= 6.5:
+        return f"{cat}，{name}表现良好"
+    return f"{cat}，整体表现平稳"
+
+
 def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: "str | bool" = False) -> None:
     """将 VLM 维度评分写入 Layer3Result（缺失字段回落默认值 5.0）
 
@@ -400,8 +477,13 @@ def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: "str | bo
     result.composition_score = round(dims.get("composition_score", 5.0), 4)
     result.color_score = round(dims.get("color_score", 5.0), 4)
     result.lighting_score = round(dims.get("lighting_score", 5.0), 4)
+    # 题材先落盘：_template_reason 需用题材拼句（否则兜底理由恒为"画面，……"）
+    if dims.get("category"):
+        result.category = dims["category"]
     if dims.get("hard_flaws"):
         result.hard_flaws = list(dims["hard_flaws"])
+    # 硬伤封顶：代码侧强制兑顶，不信任模型自觉（实测 94% 的硬伤照片未按 prompt 封顶）
+    result.capped_dims = apply_hard_flaw_caps(result)
     result.vlm_saturated = _is_saturated(dims)
     if dims.get("overall_aesthetic_score", 0) > 0:
         score = round(dims["overall_aesthetic_score"], 4)
@@ -411,16 +493,19 @@ def _apply_dims_to_result(result: Layer3Result, dims: dict, hard_flag: "str | bo
         clamp, source = _decide_vlm_clamp(hard_flag, result.person_is_subject, flaws)
         result.vlm_clamp = clamp
         result.clamp_source = source
-        if clamp:
-            reason = dims.get("reason", "")
-            suffix = "（人像硬伤：闭眼/主脸模糊，已钳制至 6 分上限）"
-            result.score_reason = f"{reason}{suffix}" if reason else suffix.strip("（）")
+        reason = _trim_reason(dims.get("reason") or "")
+        if reason:
+            result.reason_source = "vlm"
         else:
-            result.score_reason = dims.get("reason", "")
+            # VLM 漏给理由时用确定性模板拼装，保证前端每条都有可读理由
+            reason = _template_reason(result)
+            result.reason_source = "template"
+        if clamp:
+            result.score_reason = f"{reason}（人像硬伤，已钳制至 6 分上限）"
+        else:
+            result.score_reason = reason
         result.vlm_overall_score = score
         result.vlm_raw_score = score  # 保留归一化前原始分，供增量全量重归一化幂等重算
-    if dims.get("category"):
-        result.category = dims["category"]
 
 
 def apply_vlm_dimensions(
@@ -487,14 +572,22 @@ def apply_vlm_dimensions(
     return results
 
 
-def _normalize_vlm_batch(results: list[Layer3Result]) -> None:
-    """VLM 综合审美分批次归一化（p5-p95 拉伸到 0-10），防分数膨胀/缺乏区分度
+def _normalize_vlm_batch(results: list[Layer3Result], enabled: bool | None = None) -> None:
+    """VLM 综合审美分批次处理
 
-    - 仅对真实 VLM 评分（vlm_overall_score > 0）的照片生效
-    - 基于 vlm_raw_score（归一化前原始分）计算，重复调用幂等；
-      旧记录无 raw 时回落当前值（旧 checkpoint 兼容）
-    - 少于 2 张或分数分布集中时保持不变（避免噪声放大，与 TOPIQ 归一化一致）
+    - enabled=False（默认，见 config.VLM_BATCH_NORMALIZE）：不做 p5-p95 拉伸，
+      vlm_overall_score 直接采用原始绝对分。VLM 已按 prompt 的 1-10 绝对标准打分
+      （5=随手拍、8=封面级），批次拉伸会把绝对质量改写成"批次内相对位次"：
+      实测 Top100 全距被压到 0.96，而 VLM 与 TOPIQ 平均分歧达 2.32，排序退化为噪声内洗牌。
+    - enabled=True：保留旧的 p5-p95 拉伸（回退开关）。
+
+    两种情况均基于 vlm_raw_score 计算：首次调用时固化原始分，因此重复调用幂等，
+    也能通过切换开关在全量重跑时无损互转（旧 checkpoint 无 raw 时回落当前值）。
     """
+    if enabled is None:
+        from config import VLM_BATCH_NORMALIZE
+        enabled = VLM_BATCH_NORMALIZE
+
     valid = [r for r in results if r.vlm_overall_score > 0 or r.vlm_raw_score > 0]
     for r in valid:
         if r.vlm_raw_score <= 0:
@@ -502,6 +595,13 @@ def _normalize_vlm_batch(results: list[Layer3Result]) -> None:
     valid = [r for r in valid if r.vlm_raw_score > 0]  # 未评分记录（双 0）排除在外
     if len(valid) < 2:
         return
+
+    if not enabled:
+        # 绝对分模式：回填原始分（幂等），不做批次拉伸
+        for r in valid:
+            r.vlm_overall_score = r.vlm_raw_score
+        return
+
     vals = sorted(r.vlm_raw_score for r in valid)
     n = len(vals)
     lo = vals[max(0, int(n * 0.05) - 1)]
@@ -587,7 +687,7 @@ def _parse_dimension_json(text: str) -> dict:
         out = {k: round(v, 1) for k, v in scores.items()}
         reason = obj.get("reason")
         if isinstance(reason, str) and reason.strip():
-            out["reason"] = reason.strip()[:200]
+            out["reason"] = _trim_reason(reason)
         # hard_flaws：仅接受枚举白名单内字符串（过滤"无硬伤"占位符与 LLM 幻觉项），
         # 剔除空串，去重保序，上限 5 个
         flaws = obj.get("hard_flaws")
@@ -607,29 +707,74 @@ def _parse_dimension_json(text: str) -> dict:
                 out["category"] = cat
             elif cat in _CATEGORY_ALIASES:
                 out["category"] = _CATEGORY_ALIASES[cat]
-        # person_is_subject：VLM 主体裁断（钳制门控依据）；容忍布尔字符串
+        # person_is_subject：VLM 主体裁断（钳制门控依据）；容忍布尔字符串与常见变体。
+        # 历史缺陷：实测 801 条记录该字段全为 None（模型未输出/旧 prompt 无此要求），
+        # 导致钳制双证据退化为兜底路径、假脸防御永不生效，故放宽取值形式。
         pis = obj.get("person_is_subject")
         if isinstance(pis, bool):
             out["person_is_subject"] = pis
-        elif isinstance(pis, str) and pis.strip().lower() in ("true", "false"):
-            out["person_is_subject"] = pis.strip().lower() == "true"
+        elif isinstance(pis, (int, float)) and not isinstance(pis, bool):
+            out["person_is_subject"] = bool(pis)
+        elif isinstance(pis, str):
+            v = pis.strip().lower()
+            if v in ("true", "yes", "1", "是", "有"):
+                out["person_is_subject"] = True
+            elif v in ("false", "no", "0", "否", "无"):
+                out["person_is_subject"] = False
         return out
     logger.warning(f"无法从 VLM 回复中解析维度分数: {text[:120]}")
     return {}
 
 
-def _normalize_batch_scores(results: list[Layer3Result]) -> None:
-    """批次归一化 TOPIQ 综合分（p5-p95 拉伸到 0-10），拉开区分度
+# 标定参数哨兵：区分“未传参（读 config）”与“显式传 None（不标定）”
+_CALIB_UNSET = object()
 
-    - 基于 topiq_raw_score（归一化前原始分）计算，重复调用幂等；
-      旧记录无 raw 时回落当前值（旧 checkpoint 兼容）
-    - 少于 2 张或分数分布过于集中时保持不变（避免噪声放大）
+
+def _normalize_batch_scores(results: list[Layer3Result], enabled: bool | None = None,
+                            calibration=_CALIB_UNSET) -> None:
+    """TOPIQ 通道尺度处理：默认按固定锚点标定到 0-10
+
+    三种模式（config.TOPIQ_CALIBRATION / TOPIQ_BATCH_NORMALIZE）：
+    1. 固定标定（优先）：原始 MOS 按一次标定的固定锚点线性映射到 0-10，
+       所有批次共用同一映射，跳批次可比；
+    2. 不处理（calibration=None 且 enabled=False）：overall_score 直接等于原始 MOS，
+       与 VLM 同尺度（TOPIQ-IAA 的 score_range 本就是 '1,10'）；
+    3. 批次归一化（enabled=True 且无标定，历史行为，回退对比用）：p5-p95 拉伸，
+       会把"本批最差"压成 0 分，分数含义随批次漂移——实测 p5=0.036/p95=10.0，
+       全距被强行铺满。
+
+    始终基于 topiq_raw_score 计算，重复调用幂等；旧记录无 raw 时回落当前值。
+    参数为 None/_CALIB_UNSET 时读 config，测试可直接传参免 monkeypatch。
     """
+    from config import TOPIQ_BATCH_NORMALIZE, TOPIQ_CALIBRATION
+
+    if enabled is None:
+        enabled = TOPIQ_BATCH_NORMALIZE
+    if calibration is _CALIB_UNSET:
+        calibration = TOPIQ_CALIBRATION
+
     valid = [r for r in results if not r.error and (r.overall_score > 0 or r.topiq_raw_score > 0)]
     for r in valid:
         if r.topiq_raw_score <= 0:
-            r.topiq_raw_score = r.overall_score  # 首次归一化前固化原始分
+            r.topiq_raw_score = r.overall_score  # 首次处理前固化原始分（幂等基准）
     valid = [r for r in valid if r.topiq_raw_score > 0]  # 归一化到 0.0 的记录凭 raw 保留在批次内（幂等）
+    if not valid:
+        return
+
+    if calibration:
+        lo, hi = calibration
+        span = hi - lo
+        if span > 0:
+            for r in valid:
+                norm = max(0.0, min(1.0, (r.topiq_raw_score - lo) / span))
+                r.overall_score = round(norm * 10, 4)
+        return
+
+    if not enabled:
+        for r in valid:
+            r.overall_score = r.topiq_raw_score
+        return
+
     if len(valid) < 2:
         return
     vals = sorted(r.topiq_raw_score for r in valid)

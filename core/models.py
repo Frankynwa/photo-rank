@@ -47,8 +47,10 @@ class Layer3Result(BaseModel):
     lighting_score: float = 0
     vlm_overall_score: float = 0.0  # VLM 综合审美分（>0 表示真实评分，否则为未评分）
     vlm_raw_score: float = 0.0  # VLM 归一化前原始分（增量全量重归一化的参照，0=未记录）
-    score_reason: str = ""  # VLM 评分理由
+    score_reason: str = ""  # 评分理由（VLM 生成或确定性模板兜底，保证非空）
+    reason_source: str = ""  # 理由来源审计：vlm=模型生成 / template=模板兜底 / 空=VLM 未评分
     hard_flaws: list[str] = []  # VLM 自报硬伤列表（闭眼/模糊/过曝等，用于钳制与诊断）
+    capped_dims: list[str] = []  # 因硬伤被代码侧强制封顶的维度名（审计：确认封顶是否生效）
     category: str = ""  # VLM 分类标签（风景/建筑/人像/人文纪实/美食/动物/夜景/其他）
     person_is_subject: Optional[bool] = None  # VLM 裁断：人物/人脸是否为拍摄主体（None=VLM 未输出该字段）
     vlm_clamp: bool = False  # 人像硬伤钳制判定（_apply_dims 决策，归一化后统一钳制 ≤6）
@@ -83,6 +85,8 @@ class FinalResult(BaseModel):
     """最终输出：评分 + 分类标签
 
     source_video/timestamp: 仅视频帧有值（来源视频名 + 帧在视频内的时间秒数）
+    bucket/percentile: 三桶分级（select/maybe/reject）+ 批次百分位 0-100
+      （视频榜暂无分桶，保持默认空值）
     """
     path: str
     filename: str
@@ -92,6 +96,8 @@ class FinalResult(BaseModel):
     category: str = ""
     source_video: str = ""
     timestamp: float = 0.0
+    bucket: str = ""
+    percentile: float = 0.0
 
 
 class VideoFrameInfo(BaseModel):

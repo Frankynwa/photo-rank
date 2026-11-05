@@ -10,6 +10,11 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+# 人脸区域清晰度基准：Laplacian 方差随区域像素数下降（细节被压缩），
+# 历史实现用固定除 500，导致人脸 bbox（常仅占画面 2-15%）一律被判糊：
+# 实测 53 张检出脸的照片 clarity 全部 <0.3（p90=0.000），该指标完全失去区分度。
+# 现改为：先按 bbox 短边相对参考尺寸做面积补偿，再以参考 Laplacian 值为清晰基准归一化。
+from config import FACE_CLARITY_REF_LAPLACIAN, FACE_CLARITY_REF_SHORT_SIDE
 from core.models import Layer4Result
 
 logger = logging.getLogger(__name__)
@@ -234,10 +239,13 @@ class FaceAnalyzer:
                     bl = next((b.score for b in bs if b.category_name == "eyeBlinkLeft"), 0)
                     br = next((b.score for b in bs if b.category_name == "eyeBlinkRight"), 0)
                     main_blink = bl > 0.5 or br > 0.5
-                # 主脸清晰度
+                # 主脸清晰度（尺度补偿：小脸的 Laplacian 方差天然偏低，需按面积比放大后再归一化）
                 face_region = arr[y_min:y_max, x_min:x_max]
                 gray = cv2.cvtColor(face_region, cv2.COLOR_RGB2GRAY)
-                clarity = min(cv2.Laplacian(gray, cv2.CV_64F).var() / 500.0, 1.0)
+                lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                short_side = max(1, min(x_max - x_min, y_max - y_min))
+                scale = (FACE_CLARITY_REF_SHORT_SIDE / short_side) ** 2
+                clarity = min(lap_var * scale / FACE_CLARITY_REF_LAPLACIAN, 1.0)
 
             # 综合分：仅主脸闭眼扣分（背景人群闭眼不影响主体）
             overall = clarity * 0.5 + max_smile * 0.3 + (0.2 if not main_blink else 0)

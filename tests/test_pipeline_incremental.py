@@ -114,7 +114,8 @@ def _install_fakes(monkeypatch, new_paths):
             phash[str(p)] = imagehash.ImageHash(bits)
         return results, phash
 
-    def fake_cluster(paths, sharpness_scores, precomputed_hashes=None, same_date=False):
+    def fake_cluster(paths, sharpness_scores, precomputed_hashes=None, same_date=False,
+                     quality_scores=None):
         calls["l2"].append([str(p) for p in paths])
         return [
             SimilarityCluster(
@@ -211,16 +212,16 @@ class TestIncrementalWithNewPhoto:
         # VLM 只对新代表
         assert calls["vlm"] == [new_path], "VLM 应只评分新增代表"
 
-        # 结果合并：VLM 全量统一重归一化（raw 8.0×3 + 6.2 → p5-p95 拉伸）：
-        # 旧 8.0 → 10.0，新 6.2 → 正下限 0.1；原始分经 vlm_raw_score 保留
+        # 结果合并：VLM 批次归一化默认关闭（VLM_BATCH_NORMALIZE=False），
+        # 各照片保持原始绝对分，跨批次天然可比；原始分另经 vlm_raw_score 保留
         full = json.loads((env["platform_dir"] / "full_ranking.json").read_text(encoding="utf-8"))
         by_path = {r["path"]: r for r in full}
         assert len(full) == 4
         for p in env["paths"]:
-            assert by_path[p]["vlm_overall_score"] == 10.0, f"{Path(p).name} 应统一重归一化"
+            assert by_path[p]["vlm_overall_score"] == 8.0, f"{Path(p).name} 应保持绝对分"
             assert by_path[p]["vlm_raw_score"] == 8.0, "归一化前原始分应保留"
         assert by_path[new_path]["vlm_raw_score"] == pytest.approx(6.2), "新照片原始分应保留"
-        assert by_path[new_path]["vlm_overall_score"] == pytest.approx(0.1), "新照片处统一标尺下限"
+        assert by_path[new_path]["vlm_overall_score"] == pytest.approx(6.2), "新照片保持绝对分"
         # 新照片 TOPIQ 分 7.0（旧记录缺 raw → TOPIQ 重归一化不触发，保持原值）
         assert by_path[new_path]["overall_score"] == 7.0
 

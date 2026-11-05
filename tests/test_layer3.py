@@ -135,6 +135,15 @@ class TestScorePhotos:
 # ---------------------------------------------------------------------------
 
 class TestScoreRange:
+    @pytest.fixture(autouse=True)
+    def _no_calibration(self, monkeypatch):
+        """本类测 raw MOS 透传语义，关掉固定标定
+
+        标定行为（4.0/6.0 锚点）由 TestTopiqAbsoluteScoreMode 专测。
+        """
+        import config
+        monkeypatch.setattr(config, "TOPIQ_CALIBRATION", None)
+
     def test_score_passed_through_0_10(self, tmp_path):
         """模型输出即 0-10 的 MOS 分（dist_to_mos 已映射），不再 ×10"""
         mock_pyiqa, mock_torch = _build_mock_modules(score_value=0.75)
@@ -251,6 +260,8 @@ class TestInvalidPaths:
 # ---------------------------------------------------------------------------
 
 class TestNormalizeBatchScores:
+    """历史批次归一化（enabled=True）——保留作回退对比基准"""
+
     def test_batch_normalization_spreads_scores(self):
         """多张不同分数照片应被 p5-p95 拉伸拉开区分度，且保持单调"""
         from core.layer3_aesthetic import _normalize_batch_scores
@@ -260,7 +271,7 @@ class TestNormalizeBatchScores:
             Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=s)
             for i, s in enumerate([5.0, 6.0, 7.0, 8.0, 9.0], 1)
         ]
-        _normalize_batch_scores(results)
+        _normalize_batch_scores(results, enabled=True, calibration=None)
         scores = [r.overall_score for r in results]
         assert scores[0] == 0.0
         assert scores[-1] == 10.0
@@ -272,7 +283,7 @@ class TestNormalizeBatchScores:
         from core.models import Layer3Result
 
         r = Layer3Result(path="/x/1", filename="1.jpg", overall_score=6.5)
-        _normalize_batch_scores([r])
+        _normalize_batch_scores([r], calibration=None)
         assert r.overall_score == 6.5
 
     def test_concentrated_scores_no_change(self):
@@ -284,8 +295,96 @@ class TestNormalizeBatchScores:
             Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=6.0)
             for i in range(3)
         ]
-        _normalize_batch_scores(results)
+        _normalize_batch_scores(results, enabled=True, calibration=None)
         assert all(r.overall_score == 6.0 for r in results)
+
+
+class TestTopiqAbsoluteScoreMode:
+    """绝对分模式（calibration=None + enabled=False）：原始 MOS 不做批次拉伸
+
+    依据：TOPIQ-IAA 的 score_range 本就是 '1,10'，与 VLM 同尺度；p5-p95 拉伸
+    会把"本批最差"压成 0 分，分数含义随批次漂移（实测 p5=0.036/p95=10.0）。
+    """
+
+    def test_raw_mos_preserved(self):
+        """默认模式：overall_score 应原样等于原始 MOS（不做任何缩放）"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=s)
+            for i, s in enumerate([4.2, 5.0, 6.1, 7.4, 8.8], 1)
+        ]
+        _normalize_batch_scores(results, enabled=False, calibration=None)
+        assert [r.overall_score for r in results] == [4.2, 5.0, 6.1, 7.4, 8.8]
+
+    def test_absolute_score_is_batch_independent(self):
+        """同一张照片在不同批次中得分一致（绝对分的核心价值）"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        solo = [Layer3Result(path="/a.jpg", filename="a.jpg", overall_score=6.3)]
+        _normalize_batch_scores(solo, enabled=False, calibration=None)
+        mixed = [
+            Layer3Result(path="/a.jpg", filename="a.jpg", overall_score=6.3),
+            Layer3Result(path="/b.jpg", filename="b.jpg", overall_score=3.1),
+            Layer3Result(path="/c.jpg", filename="c.jpg", overall_score=9.2),
+        ]
+        _normalize_batch_scores(mixed, enabled=False, calibration=None)
+        assert solo[0].overall_score == mixed[0].overall_score == 6.3
+
+    def test_fixed_calibration_maps_anchors(self):
+        """固定标定模式：锚点 lo→ 0 分、hi→ 10 分，锚点外封顶不溢出"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=s)
+            for i, s in enumerate([3.0, 4.0, 6.0, 8.0, 9.0], 1)
+        ]
+        _normalize_batch_scores(results, enabled=False, calibration=(4.0, 8.0))
+        assert [r.overall_score for r in results] == [0.0, 0.0, 5.0, 10.0, 10.0]
+
+    def test_calibration_is_batch_independent(self):
+        """标定的核心价值：同一张片在不同批次得到同一分（不随批次漂移）"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        def run(vals):
+            rs = [Layer3Result(path=f"/x/{i}", filename=f"{i}", overall_score=s)
+                  for i, s in enumerate(vals)]
+            _normalize_batch_scores(rs, enabled=False, calibration=(4.0, 6.0))
+            return {r.path: r.overall_score for r in rs}
+
+        solo = run([5.0])
+        mixed = run([2.0, 5.0, 9.0])
+        assert solo["/x/0"] == mixed["/x/1"] == 5.0
+
+    def test_default_calibration_anchor_range(self):
+        """实测锚点 4.0/6.0：低于 4 封底、高于 6 封顶（防分数体系崩坏）"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=s)
+            for i, s in enumerate([2.8, 4.0, 5.0, 6.0, 6.2], 1)
+        ]
+        _normalize_batch_scores(results, enabled=False, calibration=(4.0, 6.0))
+        assert [r.overall_score for r in results] == [0.0, 0.0, 5.0, 10.0, 10.0]
+
+    def test_switch_roundtrip_via_raw(self):
+        """开关互转无损：开启归一化后再关，应凭 raw 回到原始 MOS"""
+        from core.layer3_aesthetic import _normalize_batch_scores
+        from core.models import Layer3Result
+
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", overall_score=s)
+            for i, s in enumerate([5.0, 6.0, 7.0, 8.0, 9.0], 1)
+        ]
+        _normalize_batch_scores(results, enabled=True, calibration=None)
+        assert results[0].overall_score == 0.0  # 已被批次拉伸
+        _normalize_batch_scores(results, enabled=False, calibration=None)  # 关回去
+        assert [r.overall_score for r in results] == [5.0, 6.0, 7.0, 8.0, 9.0]
 
 
 class TestRawScorePreservation:
@@ -344,7 +443,7 @@ class TestRawScorePreservation:
         # 新 1 张：新子批次单独评分 raw=8.0（尚未归一化）
         new = Layer3Result(path="/new/1", filename="n.jpg", vlm_overall_score=8.0, vlm_raw_score=8.0)
         batch = old + [new]
-        _normalize_vlm_batch(batch)
+        _normalize_vlm_batch(batch, enabled=True)
         # 全量 raw [7, 8, 8.5, 9.5]：lo=7, hi=vals[2]=8.5，span=1.5
         by_path = {r.path: r.vlm_overall_score for r in batch}
         assert by_path["/old/1"] == pytest.approx(0.1)  # 最低分正下限
@@ -534,6 +633,137 @@ class TestBuildDimensionPrompt:
 # VLM 人像硬伤钳制测试（程序化兜底，不依赖 LLM 自觉）
 # ---------------------------------------------------------------------------
 
+class TestReasonTrim:
+    """理由截断：优先在标点处收尾，避免中文被砍成半句
+
+    历史实现是 reason.strip()[:200]，长理由被硬截在半句上，比不截更难看。
+    """
+
+    def test_short_text_unchanged(self):
+        from core.layer3_aesthetic import _trim_reason
+        assert _trim_reason("构图讲究，色彩和谐") == "构图讲究，色彩和谐"
+
+    def test_whitespace_normalized(self):
+        """换行与多余空白压成单空格（前端单行展示）"""
+        from core.layer3_aesthetic import _trim_reason
+        assert _trim_reason("  构图  不错\n\n光影好  ") == "构图 不错 光影好"
+
+    def test_long_text_cut_at_punctuation(self):
+        """超长时回退到最近的句读处，不在句子中间开刀"""
+        from core.layer3_aesthetic import _REASON_MAX_CHARS, _trim_reason
+
+        text = ("这张照片整体构图非常讲究，三分法运用得恰到好处，"
+                "色彩和谐且有氛围感，光影层次丰富，主体突出，是不可多得的佳作")
+        out = _trim_reason(text)
+        assert len(out) <= _REASON_MAX_CHARS
+        assert out.endswith("，")  # 在标点处收尾，不带省略号
+        assert out == "这张照片整体构图非常讲究，三分法运用得恰到好处，色彩和谐且有氛围感，"
+
+    def test_no_punctuation_appends_ellipsis(self):
+        """找不到可用断点（如无标点长串）时截断并补省略号"""
+        from core.layer3_aesthetic import _REASON_MAX_CHARS, _trim_reason
+
+        out = _trim_reason("ab" * 30)
+        assert out.endswith("…")
+        assert len(out) == _REASON_MAX_CHARS + 1
+
+    def test_early_punctuation_ignored(self):
+        """开头的标点不算断点（避免把理由砍得只剩几个字）"""
+        from core.layer3_aesthetic import _REASON_MAX_CHARS, _trim_reason
+
+        out = _trim_reason("好，" + "x" * 60)
+        assert len(out) <= _REASON_MAX_CHARS + 1
+        assert out.endswith("…")
+
+
+class TestReasonTemplateFallback:
+    """VLM 漏给理由时的确定性模板兜底：保证前端每条都有可读理由"""
+
+    def test_vlm_reason_kept_and_sourced_vlm(self):
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5, "lighting_score": 7.0,
+                "overall_aesthetic_score": 6.8, "reason": "主体突出，层次分明",
+                "category": "风景"}
+        _apply_dims_to_result(r, dims)
+        assert r.score_reason == "主体突出，层次分明"
+        assert r.reason_source == "vlm"
+
+    def test_missing_reason_falls_back_to_template(self):
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5, "lighting_score": 7.0,
+                "overall_aesthetic_score": 6.8, "category": "风景"}
+        _apply_dims_to_result(r, dims)
+        assert r.score_reason == "风景，构图突出"
+        assert r.reason_source == "template"
+
+    def test_blank_reason_falls_back_to_template(self):
+        """空白字符串等同未给理由"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5, "lighting_score": 7.0,
+                "overall_aesthetic_score": 6.8, "reason": "   \n ", "category": "夜景"}
+        _apply_dims_to_result(r, dims)
+        assert r.reason_source == "template"
+        assert r.score_reason == "夜景，构图突出"
+
+    def test_template_uses_category_from_same_payload(self):
+        """回归：category 必须先落盘再拼模板（否则理由恒为画面开头）"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 7.0, "color_score": 7.0, "lighting_score": 7.0,
+                "overall_aesthetic_score": 7.0, "category": "美食"}
+        _apply_dims_to_result(r, dims)
+        assert not r.score_reason.startswith("画面，")
+        assert r.score_reason.startswith("美食，")
+
+    def test_template_flaw_tier(self):
+        """有硬伤时优先陈述硬伤（最多两项）"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5, "lighting_score": 7.0,
+                "overall_aesthetic_score": 6.8, "category": "风景",
+                "hard_flaws": ["模糊", "歪斜", "噪点明显"]}
+        _apply_dims_to_result(r, dims)
+        assert r.reason_source == "template"
+        assert r.score_reason == "风景，存在模糊、歪斜"
+
+    def test_template_highlight_tiers(self):
+        """亮点三档：≥8 突出 / ≥6.5 良好 / <6.5 平稳"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+
+        cases = [
+            ({"composition_score": 8.5, "color_score": 7.0, "lighting_score": 6.0}, "构图突出"),
+            ({"composition_score": 7.0, "color_score": 6.0, "lighting_score": 6.0}, "构图表现良好"),
+            ({"composition_score": 6.0, "color_score": 6.0, "lighting_score": 6.0}, "整体表现平稳"),
+        ]
+        for dims, expect in cases:
+            r = Layer3Result(path="/a.jpg", filename="a.jpg")
+            _apply_dims_to_result(r, {**dims, "overall_aesthetic_score": 7.0, "category": "建筑"})
+            assert r.score_reason == f"建筑，{expect}", r.score_reason
+
+    def test_template_with_clamp_suffix(self):
+        """模板兜底 + 钳制后缀组合，两者都在"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        dims = {"composition_score": 8.0, "color_score": 7.5, "lighting_score": 7.0,
+                "overall_aesthetic_score": 6.8, "category": "人像",
+                "person_is_subject": True}
+        _apply_dims_to_result(r, dims, hard_flag="blink")
+        assert r.reason_source == "template"
+        assert "人像，构图突出" in r.score_reason
+        assert "已钳制至 6 分上限" in r.score_reason
+
+    def test_unscored_keeps_reason_empty(self):
+        """VLM 未给出综合分时不做兜底（那条记录本来就不算已评分）"""
+        from core.layer3_aesthetic import _apply_dims_to_result
+        r = Layer3Result(path="/a.jpg", filename="a.jpg")
+        _apply_dims_to_result(r, {"composition_score": 7.0, "category": "风景"})
+        assert r.score_reason == ""
+        assert r.reason_source == ""
+
+
 class TestHardFlagClamping:
     """两阶段钳制语义：_apply_dims 仅记录 vlm_clamp 不改分，
     归一化后由 clamp_hard_flaws_after_normalize 统一钳制 ≤6（F3）"""
@@ -686,7 +916,7 @@ class TestNormalizeVlmBatch:
             Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", vlm_overall_score=s)
             for i, s in enumerate([5.0, 6.0, 7.0, 8.0, 9.0], 1)
         ]
-        _normalize_vlm_batch(results)
+        _normalize_vlm_batch(results, enabled=True)
         scores = [r.vlm_overall_score for r in results]
         assert scores[0] == 0.1  # 正下限 0.01*10
         assert scores[-1] == 10.0
@@ -707,6 +937,22 @@ class TestNormalizeVlmBatch:
         _normalize_vlm_batch([r0, r1])
         assert r0.vlm_overall_score == 0.0
         assert r1.vlm_overall_score == 8.0  # 仅 1 个有效分，不归一化
+
+    def test_disabled_keeps_absolute(self):
+        """默认关闭归一化：VLM 原始绝对分应原样保留（不因批次内位次被拉伸）"""
+        from core.layer3_aesthetic import _normalize_vlm_batch
+        results = [
+            Layer3Result(path=f"/x/{i}", filename=f"{i}.jpg", vlm_overall_score=s)
+            for i, s in enumerate([3.2, 5.0, 7.4, 9.1], 1)
+        ]
+        _normalize_vlm_batch(results, enabled=False)
+        assert [r.vlm_overall_score for r in results] == [3.2, 5.0, 7.4, 9.1]
+        # raw 已固化，切换开关可幂等互转
+        _normalize_vlm_batch(results, enabled=True)
+        assert results[0].vlm_overall_score == 0.1  # 正下限 0.01×10
+        assert results[-1].vlm_overall_score == 10.0
+        _normalize_vlm_batch(results, enabled=False)
+        assert [r.vlm_overall_score for r in results] == [3.2, 5.0, 7.4, 9.1]
 
     def test_concentrated_no_change(self):
         """分数分布集中时保持不变，避免噪声放大"""
